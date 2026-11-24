@@ -592,6 +592,8 @@ pub struct Config {
     additional_settings: Option<Vec<(u64, u64)>>,
 
     max_priority_update_size: u64,
+
+    chromium: bool,
 }
 
 impl Config {
@@ -605,7 +607,29 @@ impl Config {
             additional_settings: None,
             max_priority_update_size:
                 PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
+            chromium: false,
         })
+    }
+
+    /// netweir: opens a client's HTTP/3 connection as Chromium's QUIC
+    /// does (quiche/quic/core/http/quic_send_control_stream.cc,
+    /// MaybeSendSettingsFrame; http_encoder.cc, SerializeGreasingFrame):
+    ///
+    /// - SETTINGS in identifier order, with one GREASE setting, its
+    ///   identifier `0x1f * N + 0x21` and its value both from a random
+    ///   32-bit N, and H3_DATAGRAM under its RFC 9297 identifier only;
+    /// - right after SETTINGS on the control stream, one GREASE frame of
+    ///   type `0x1f * N + 0x21` with `N % 4` random bytes;
+    /// - no GREASE stream and no GREASE frames on request streams;
+    /// - QPACK encoder and decoder streams opened only once there's an
+    ///   instruction to send on them;
+    /// - PRIORITY_UPDATE values written as a structured-field dictionary,
+    ///   `u=0, i`, the default urgency and incremental flag left out
+    ///   (quic_stream_priority.cc, SerializePriorityFieldValue).
+    ///
+    /// The default value is `false`.
+    pub fn enable_chromium(&mut self, v: bool) {
+        self.chromium = v;
     }
 
     /// Sets the `SETTINGS_MAX_FIELD_SECTION_SIZE` setting.
@@ -1036,6 +1060,9 @@ pub struct Connection {
     peer_goaway_id: Option<u64>,
 
     max_priority_update_size: u64,
+
+    /// netweir: see `Config::enable_chromium`.
+    chromium: bool,
 }
 
 impl Connection {
@@ -1093,6 +1120,8 @@ impl Connection {
             peer_goaway_id: None,
 
             max_priority_update_size: config.max_priority_update_size,
+
+            chromium: config.chromium && !is_server,
         })
     }
 
@@ -1132,6 +1161,11 @@ impl Connection {
                 return Err(e);
             },
         };
+
+        // netweir: Chromium opens these once it has something to send.
+        if http3_conn.chromium {
+            return Ok(http3_conn);
+        }
 
         // Try opening QPACK streams, but ignore errors if it fails since we
         // don't need them right now.
@@ -1493,7 +1527,7 @@ impl Connection {
         let mut d = [42; 10];
         let mut b = octets::OctetsMut::with_slice(&mut d);
 
-        if !self.frames_greased && conn.grease {
+        if !self.frames_greased && conn.grease && !self.chromium {
             self.send_grease_frames(conn, stream_id)?;
             self.frames_greased = true;
         }
@@ -2000,6 +2034,17 @@ impl Connection {
 
         if priority.incremental {
             field_value.push_str(",i");
+        }
+
+        if self.chromium {
+            let mut members = Vec::new();
+            if urgency != PRIORITY_URGENCY_DEFAULT {
+                members.push(format!("u={urgency}"));
+            }
+            if priority.incremental {
+                members.push("i".to_string());
+            }
+            field_value = members.join(", ");
         }
 
         let priority_field_value = field_value.as_bytes();
@@ -2531,6 +2576,10 @@ impl Connection {
             q.add_event_data_now(ev_data).ok();
         });
 
+        if self.chromium {
+            return self.send_chromium_settings(conn);
+        }
+
         let grease = if conn.grease {
             Some((grease_value(), grease_value()))
         } else {
@@ -2580,6 +2629,71 @@ impl Connection {
 
                 q.add_event_data_now(ev_data).ok();
             });
+        }
+
+        Ok(())
+    }
+
+    /// netweir: SETTINGS and a GREASE frame on the control stream, as
+    /// Chromium sends them (see `Config::enable_chromium`).
+    fn send_chromium_settings<F: BufFactory>(
+        &mut self, conn: &mut super::Connection<F>,
+    ) -> Result<()> {
+        let local = &self.local_settings;
+        let mut settings = Vec::new();
+
+        let known = [
+            (frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY, local.qpack_max_table_capacity),
+            (frame::SETTINGS_MAX_FIELD_SECTION_SIZE, local.max_field_section_size),
+            (frame::SETTINGS_QPACK_BLOCKED_STREAMS, local.qpack_blocked_streams),
+            (
+                frame::SETTINGS_ENABLE_CONNECT_PROTOCOL,
+                local.connect_protocol_enabled,
+            ),
+            (frame::SETTINGS_H3_DATAGRAM, local.h3_datagram),
+        ];
+
+        for (id, value) in known {
+            if let Some(value) = value {
+                settings.push((id, value));
+            }
+        }
+
+        settings.extend(local.additional_settings.iter().flatten().copied());
+
+        let n = u64::from(super::rand::rand_u64() as u32);
+        let value = u64::from(super::rand::rand_u64() as u32);
+        settings.push((0x1f * n + 0x21, value));
+
+        settings.sort_unstable();
+
+        let mut payload = Vec::new();
+        for (id, value) in &settings {
+            put_varint_vec(&mut payload, *id);
+            put_varint_vec(&mut payload, *value);
+        }
+
+        let mut out = Vec::new();
+        put_varint_vec(&mut out, frame::SETTINGS_FRAME_TYPE_ID);
+        put_varint_vec(&mut out, payload.len() as u64);
+        out.extend_from_slice(&payload);
+
+        let n = super::rand::rand_u64() as u32;
+        let mut grease = vec![0; (n % 4) as usize];
+        super::rand::rand_bytes(&mut grease);
+        put_varint_vec(&mut out, 0x1f * u64::from(n) + 0x21);
+        put_varint_vec(&mut out, grease.len() as u64);
+        out.extend_from_slice(&grease);
+
+        if let Some(id) = self.control_stream_id {
+            conn.stream_send(id, &out, false)?;
+
+            trace!(
+                "{} tx frm SETTINGS stream={} len={}",
+                conn.trace_id(),
+                id,
+                out.len()
+            );
         }
 
         Ok(())
@@ -3402,6 +3516,15 @@ impl Connection {
     }
 }
 
+/// netweir: appends `v` to `out` as a QUIC variable-length integer.
+fn put_varint_vec(out: &mut Vec<u8>, v: u64) {
+    let mut d = [0; 8];
+    let mut b = octets::OctetsMut::with_slice(&mut d);
+    // Every value written here fits in 62 bits.
+    let len = b.put_varint(v).map(|w| w.len()).unwrap_or(0);
+    out.extend_from_slice(&d[..len]);
+}
+
 /// Generates an HTTP/3 GREASE variable length integer.
 pub fn grease_value() -> u64 {
     let n = super::rand::rand_u64_uniform(148_764_065_110_560_899);
@@ -3510,15 +3633,18 @@ pub mod testing {
             self.client.send_settings(&mut self.pipe.client)?;
             self.pipe.advance().ok();
 
-            self.client
-                .open_qpack_encoder_stream(&mut self.pipe.client)?;
-            self.pipe.advance().ok();
+            // netweir: as with_transport, which opens none for Chromium.
+            if !self.client.chromium {
+                self.client
+                    .open_qpack_encoder_stream(&mut self.pipe.client)?;
+                self.pipe.advance().ok();
 
-            self.client
-                .open_qpack_decoder_stream(&mut self.pipe.client)?;
-            self.pipe.advance().ok();
+                self.client
+                    .open_qpack_decoder_stream(&mut self.pipe.client)?;
+                self.pipe.advance().ok();
+            }
 
-            if self.pipe.client.grease {
+            if self.pipe.client.grease && !self.client.chromium {
                 self.client.open_grease_stream(&mut self.pipe.client)?;
             }
 
@@ -3814,6 +3940,69 @@ mod tests {
     use super::*;
 
     use super::testing::*;
+
+    // netweir: a client's control stream and PRIORITY_UPDATE as Chrome's.
+    #[test]
+    fn chromium_settings_grease_and_priority_update() {
+        let (mut config, mut h3_config) = Session::default_configs().unwrap();
+        config.enable_dgram(true, 100, 100);
+        h3_config.set_qpack_max_table_capacity(65536);
+        h3_config.set_max_field_section_size(262_144);
+        h3_config.set_qpack_blocked_streams(100);
+        h3_config.enable_chromium(true);
+
+        let mut greases = std::collections::HashSet::new();
+        for _ in 0..8 {
+            let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
+            s.handshake().unwrap();
+
+            let raw = s.server.peer_settings_raw().unwrap().to_vec();
+            let ids: Vec<u64> = raw.iter().map(|(id, _)| *id).collect();
+            let mut sorted = ids.clone();
+            sorted.sort();
+            assert_eq!(ids, sorted);
+            let is_grease = |id: u64| id >= 0x21 && (id - 0x21) % 0x1f == 0;
+            let known: Vec<(u64, u64)> =
+                raw.iter().copied().filter(|(id, _)| !is_grease(*id)).collect();
+            assert_eq!(known, vec![(1, 65536), (6, 262_144), (7, 100), (0x33, 1)]);
+            let grease: Vec<u64> =
+                ids.iter().copied().filter(|id| is_grease(*id)).collect();
+            assert_eq!(grease.len(), 1);
+            greases.insert(grease[0]);
+
+            // Only the control stream: no QPACK or GREASE streams.
+            assert_eq!(s.server.peer_qpack_streams.encoder_stream_id, None);
+            assert_eq!(s.server.peer_qpack_streams.decoder_stream_id, None);
+
+            let (stream, _) = s.send_request(true).unwrap();
+            s.client
+                .send_priority_update_for_request(
+                    &mut s.pipe.client,
+                    stream,
+                    &Priority {
+                        urgency: 0,
+                        incremental: true,
+                    },
+                )
+                .unwrap();
+            s.advance().ok();
+            loop {
+                match s.poll_server() {
+                    Ok((id, Event::PriorityUpdate)) => {
+                        assert_eq!(id, stream);
+                        break;
+                    },
+                    Ok(_) => continue,
+                    Err(e) => panic!("{e:?}"),
+                }
+            }
+            assert_eq!(
+                s.server.take_last_priority_update(stream),
+                Ok(b"u=0, i".to_vec())
+            );
+        }
+        assert_eq!(greases.len(), 8);
+    }
 
     #[test]
     /// Make sure that random GREASE values is within the specified limit.
