@@ -43,6 +43,21 @@ behaviour comes from:
 - QPACK: the decoder fills and uses the dynamic table, and acknowledges it.
 - No libc cap, which clashed with Netweir's lockfile.
 
+On the `safari-27` branch, which builds on `chrome-157`, three more options
+lay a connection out as a recording of Safari 27.2 on macOS showed it.
+Safari's QUIC is Apple's Network.framework, whose source isn't public, so
+these follow the recording rather than the code:
+
+- `Config::enable_safari_transport_params`: the parameters in ascending
+  order from a random one, wrapping round, with no GREASE, and defaults
+  left out.
+- `Config::enable_safari_initial`: at most 999 bytes of the ClientHello in
+  each Initial packet, one CRYPTO frame, then PADDING frames to the end of
+  the 1200-byte datagram; packet numbers from 0.
+- `h3::Config::enable_safari`: SETTINGS as `enable_chromium` sends them,
+  without SETTINGS_MAX_FIELD_SECTION_SIZE and without the GREASE frame
+  after them.
+
 None of it changes quiche unless it's turned on, except the QPACK decoder,
 plain AES-GCM, and the pruned workspace. Congestion control, pacing and
 loss recovery are quiche's own. The licence is unchanged: BSD-2-Clause, in
