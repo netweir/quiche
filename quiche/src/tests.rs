@@ -14790,3 +14790,94 @@ fn chromium_initial_flight_packet_lost() {
         }
     }
 }
+
+// netweir: the CRYPTO frames of a client's Initial packet, as (offset,
+// length), or `None` if it isn't an Initial the server can still open.
+fn chromium_initial_crypto(
+    server: &Connection, mut datagram: Vec<u8>,
+) -> Option<Vec<(u64, usize)>> {
+    let mut b = octets::OctetsMut::with_slice(&mut datagram);
+    let mut hdr = Header::from_bytes(&mut b, 16).ok()?;
+    if hdr.ty != Type::Initial {
+        return None;
+    }
+    let len = b.get_varint().unwrap() as usize;
+    let aead = server.crypto_ctx[packet::Epoch::Initial]
+        .crypto_open
+        .as_ref()?;
+    packet::decrypt_hdr(&mut b, &mut hdr, aead).unwrap();
+    let mut payload =
+        packet::decrypt_pkt(&mut b, hdr.pkt_num, hdr.pkt_num_len, len, aead)
+            .unwrap();
+    let mut crypto = Vec::new();
+    while payload.cap() > 0 {
+        if let frame::Frame::Crypto { data } =
+            frame::Frame::from_bytes(&mut payload, hdr.ty).unwrap()
+        {
+            crypto.push((data.off(), data.len()));
+        }
+    }
+    Some(crypto)
+}
+
+// netweir: a ClientHello of four packets whose first two are lost, so the
+// retransmission starts at offset 0 with a gap after it, still completes
+// the handshake.
+#[test]
+fn chromium_initial_flight_first_packets_lost() {
+    let protos: Vec<Vec<u8>> =
+        (0..12).map(|i| vec![b'a' + i as u8; 200]).collect();
+    let mut alpn: Vec<&[u8]> = protos.iter().map(|p| &p[..]).collect();
+    alpn.push(b"proto1");
+
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.enable_chromium_initial(true);
+    config.set_max_send_udp_payload_size(1250);
+    config.set_application_protos(&alpn).unwrap();
+
+    let mut pipe = test_utils::Pipe::with_client_config(&mut config).unwrap();
+    let mut flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    assert_eq!(flight.len(), 4);
+
+    // Only the third arrives, and its ACK reaches the client.
+    let third = flight.remove(2);
+    test_utils::process_flight(&mut pipe.server, vec![third]).unwrap();
+    let reply = test_utils::emit_flight(&mut pipe.server).unwrap();
+    test_utils::process_flight(&mut pipe.client, reply).unwrap();
+    let fourth = flight.remove(2);
+
+    for round in 0..12 {
+        if let Some(t) = pipe.client.timeout() {
+            std::thread::sleep(t + Duration::from_millis(1));
+            pipe.client.on_timeout();
+        }
+        if let Ok(mut f) = test_utils::emit_flight(&mut pipe.client) {
+            // A resent hello isn't split again: each packet carries one
+            // run of it, however its frames divide that run.
+            for (datagram, _) in &f {
+                if let Some(mut crypto) =
+                    chromium_initial_crypto(&pipe.server, datagram.clone())
+                {
+                    crypto.sort();
+                    for w in crypto.windows(2) {
+                        assert_eq!(w[0].0 + w[0].1 as u64, w[1].0);
+                    }
+                }
+            }
+            if round == 0 {
+                f.push(fourth.clone());
+            }
+            test_utils::process_flight(&mut pipe.server, f).unwrap();
+        }
+        if let Ok(f) = test_utils::emit_flight(&mut pipe.server) {
+            test_utils::process_flight(&mut pipe.client, f).unwrap();
+        }
+        if pipe.client.is_established() {
+            break;
+        }
+    }
+
+    assert!(pipe.client.is_established());
+    assert_eq!(pipe.client.local_error(), None);
+    assert_eq!(pipe.server.local_error(), None);
+}

@@ -5199,7 +5199,9 @@ impl<F: BufFactory> Connection<F> {
             // have gaps, and each run needs a frame at its own offset.
             let pending = send.contiguous_len();
 
-            let split = if off == 0 {
+            // Only the hello's first sending is split; a resend takes what
+            // fits in this packet.
+            let split = if send.emit_off() == 0 {
                 chaos::split_first_flight(left, pending)
             } else {
                 None
@@ -5231,7 +5233,8 @@ impl<F: BufFactory> Connection<F> {
             };
 
             let used = chaos::wire_len(&chaos::protect(&ranges, 0));
-            let layout = chaos::protect(&ranges, left - used);
+            let room = left.checked_sub(used).ok_or(Error::BufferTooShort)?;
+            let layout = chaos::protect(&ranges, room);
 
             for f in &layout {
                 match *f {

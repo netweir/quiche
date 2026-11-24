@@ -357,6 +357,11 @@ impl<F: BufFactory> SendBuf<F> {
         Ok((out.len() - out_len, fin))
     }
 
+    /// netweir: the largest offset sent so far, 0 before the first emit.
+    pub fn emit_off(&self) -> u64 {
+        self.emit_off
+    }
+
     /// netweir: the length of the run of data from `off_front()` with no
     /// gap in it, as much as one call to [`Self::emit`] can return.
     pub fn contiguous_len(&self) -> usize {
