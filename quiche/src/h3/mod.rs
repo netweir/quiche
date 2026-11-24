@@ -1071,8 +1071,9 @@ pub struct Connection {
     chromium: bool,
 
     /// netweir: request streams whose field section waits for dynamic
-    /// table entries, with the section and its frame's length.
-    blocked: hash_map::HashMap<u64, (Vec<u8>, u64)>,
+    /// table entries, with the section and whether the stream's FIN had
+    /// been read.
+    blocked: hash_map::HashMap<u64, (Vec<u8>, bool)>,
 
     /// netweir: field sections decoded once their entries arrived, for
     /// `poll()` to return.
@@ -1973,7 +1974,7 @@ impl Connection {
                 // The reset is consumed here, so the stream will not become
                 // readable again for poll() to handle it.
                 Err(e @ Error::TransportError(crate::Error::StreamReset(_))) => {
-                    self.process_reset_stream(stream_id);
+                    self.process_reset_stream(conn, stream_id);
 
                     return Err(e);
                 },
@@ -2203,6 +2204,22 @@ impl Connection {
             return Err(Error::Done);
         }
 
+        // netweir: a blocked stream the application stopped reading is
+        // abandoned. One the transport has collected is complete if its
+        // FIN had been read, and was abandoned if not.
+        let abandoned: Vec<u64> = self
+            .blocked
+            .iter()
+            .filter(|(id, (_, fin))| match conn.streams.get(**id) {
+                Some(s) => s.recv.is_draining(),
+                None => !fin,
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for stream_id in abandoned {
+            self.cancel_qpack_stream(conn, stream_id);
+        }
+
         // Process control streams first.
         if let Some(stream_id) = self.peer_control_stream_id {
             match self.process_control_stream(conn, stream_id) {
@@ -2256,7 +2273,7 @@ impl Connection {
                 // Return early if the stream was reset, to avoid returning
                 // a Finished event later as well.
                 Err(Error::TransportError(crate::Error::StreamReset(e))) => {
-                    self.process_reset_stream(s);
+                    self.process_reset_stream(conn, s);
 
                     return Ok((s, Event::Reset(e)));
                 },
@@ -2855,8 +2872,20 @@ impl Connection {
         });
 
         // netweir: a stream whose field section waits for dynamic table
-        // entries is read no further until they arrive.
+        // entries is read no further until they arrive, but a reset of it
+        // is reported. Only a reset stream is read here: on one at its FIN
+        // the read could complete the stream and have it collected.
         if self.blocked.contains_key(&stream_id) {
+            if conn.streams.get(stream_id).is_some_and(|s| s.recv.is_reset()) {
+                if let Err(crate::Error::StreamReset(e)) =
+                    conn.stream_recv(stream_id, &mut [])
+                {
+                    return Err(Error::TransportError(
+                        crate::Error::StreamReset(e),
+                    ));
+                }
+            }
+
             return Err(Error::Done);
         }
 
@@ -3298,12 +3327,33 @@ impl Connection {
     // Marks a reset stream as finished, so that neither poll() nor a later
     // recv_body() call queues a Finished event for it, and removes the stream
     // if the local side is also finished.
-    fn process_reset_stream(&mut self, stream_id: u64) {
+    fn process_reset_stream<F: BufFactory>(
+        &mut self, conn: &mut super::Connection<F>, stream_id: u64,
+    ) {
         if let Some(stream) = self.streams.get_mut(&stream_id) {
             stream.finished();
         }
 
         self.remove_local_finished_stream(stream_id);
+
+        self.cancel_qpack_stream(conn, stream_id);
+    }
+
+    /// netweir: forgets the field section a reset or abandoned request
+    /// stream waits for, and sends a Stream Cancellation (RFC 9204,
+    /// Section 4.4.2), as Chromium's QuicSpdyStream calls
+    /// QpackDecoder::OnStreamReset for a request stream that's reset
+    /// either way.
+    fn cancel_qpack_stream<F: BufFactory>(
+        &mut self, conn: &mut super::Connection<F>, stream_id: u64,
+    ) {
+        if !crate::stream::is_bidi(stream_id) {
+            return;
+        }
+
+        self.blocked.remove(&stream_id);
+        self.qpack_decoder.cancel_stream(stream_id);
+        self.flush_qpack_decoder(conn);
     }
 
     fn pop_finished_stream<F: BufFactory>(
@@ -3325,6 +3375,7 @@ impl Connection {
             if let Err(crate::Error::StreamReset(e)) =
                 conn.stream_recv(finished, &mut [])
             {
+                self.cancel_qpack_stream(conn, finished);
                 return Some((finished, Event::Reset(e)));
             }
         }
@@ -3433,9 +3484,10 @@ impl Connection {
                     {
                         // The stream isn't read again until these are
                         // decoded, so no later HEADERS can replace them.
+                        let fin = conn.stream_finished(stream_id);
                         let earlier = self
                             .blocked
-                            .insert(stream_id, (header_block.to_vec(), payload_len));
+                            .insert(stream_id, (header_block.to_vec(), fin));
                         debug_assert!(earlier.is_none());
                         return Err(Error::Done);
                     },
@@ -4317,6 +4369,75 @@ mod tests {
                 vec![(stream, qpack_headers(false)), (stream, Event::Finished)]
             };
             assert_eq!(qpack_client_events(&mut s), expected, "body {body}");
+        }
+    }
+
+    // netweir: what the client sent on its decoder stream, read at the
+    // server's transport without the server's HTTP/3 layer.
+    fn qpack_decoder_stream(s: &mut Session) -> Vec<u8> {
+        s.advance().ok();
+        let Some(id) = s.client.local_qpack_streams.decoder_stream_id else {
+            return Vec::new();
+        };
+        let mut b = [0; 100];
+        let (n, _) = s.pipe.server.stream_recv(id, &mut b).unwrap_or((0, false));
+        b[..n].to_vec()
+    }
+
+    // netweir: a stream reset while its headers wait is reported, and its
+    // field section is cancelled (RFC 9204, Section 4.4.2).
+    #[test]
+    fn qpack_blocked_stream_reset() {
+        let (mut s, stream) = qpack_session(false);
+        qpack_blocked_headers(&mut s, stream, false);
+        assert_eq!(s.poll_client(), Err(Error::Done));
+
+        s.pipe
+            .server
+            .stream_shutdown(stream, crate::Shutdown::Write, 42)
+            .unwrap();
+        s.advance().ok();
+        assert_eq!(s.poll_client(), Ok((stream, Event::Reset(42))));
+        assert!(s.client.blocked.is_empty());
+
+        qpack_insert(&mut s);
+        assert_eq!(qpack_client_events(&mut s), vec![]);
+        // The decoder stream's type, then Stream Cancellation for stream 0
+        // and no Section Acknowledgment.
+        assert_eq!(qpack_decoder_stream(&mut s), vec![0x03, 0x40]);
+    }
+
+    // netweir: a stream the application stops reading while its headers
+    // wait is forgotten, and its field section cancelled. With its body
+    // and FIN already arrived, the transport collects it at once.
+    #[test]
+    fn qpack_blocked_stream_abandoned() {
+        for body in [false, true] {
+            let (mut s, stream) = qpack_session(false);
+            qpack_blocked_headers(&mut s, stream, false);
+            if body {
+                s.send_frame_server(
+                    frame::Frame::Data {
+                        payload: vec![7; 10],
+                    },
+                    stream,
+                    true,
+                )
+                .unwrap();
+            }
+            assert_eq!(s.poll_client(), Err(Error::Done));
+
+            s.pipe
+                .client
+                .stream_shutdown(stream, crate::Shutdown::Read, 0)
+                .unwrap();
+            assert_eq!(s.pipe.client.streams.get(stream).is_none(), body);
+            assert_eq!(s.poll_client(), Err(Error::Done));
+            assert!(s.client.blocked.is_empty());
+
+            qpack_insert(&mut s);
+            assert_eq!(qpack_client_events(&mut s), vec![]);
+            assert_eq!(qpack_decoder_stream(&mut s), vec![0x03, 0x40]);
         }
     }
 

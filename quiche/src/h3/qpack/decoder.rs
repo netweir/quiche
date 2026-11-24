@@ -331,6 +331,16 @@ impl Decoder {
         Ok(headers)
     }
 
+    /// netweir: queues a Stream Cancellation for  (RFC 9204,
+    /// Section 4.4.2). As in Chromium's QpackDecoder::OnStreamReset, a
+    /// decoder without a dynamic table has nothing to cancel and sends
+    /// none.
+    pub fn cancel_stream(&mut self, stream_id: u64) {
+        if self.table.max_capacity() > 0 {
+            encode_int_into(&mut self.instructions, stream_id, 0x40, 6);
+        }
+    }
+
     /// Decodes a QPACK header block into a list of headers.
     pub fn decode(&mut self, buf: &[u8], max_size: u64) -> Result<Vec<Header>> {
         self.decode_section(buf, max_size).map(|(headers, _)| headers)
@@ -755,6 +765,19 @@ mod tests {
         }
         assert_eq!(d.insert_count(), 1);
         assert!(d.partial.is_empty());
+    }
+
+    // netweir: Stream Cancellation, a 6-bit prefix after 01.
+    #[test]
+    fn stream_cancellation() {
+        let mut d = Decoder::with_max_table_capacity(4096);
+        d.cancel_stream(4);
+        d.cancel_stream(100);
+        assert_eq!(d.take_instructions(), vec![0x44, 0x7f, 0x25]);
+
+        let mut d = Decoder::new();
+        d.cancel_stream(4);
+        assert!(d.take_instructions().is_empty());
     }
 
     #[test]

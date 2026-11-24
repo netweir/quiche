@@ -428,6 +428,11 @@ impl RecvBuf {
         false
     }
 
+    /// netweir: returns true if the peer reset the stream.
+    pub fn is_reset(&self) -> bool {
+        self.error.is_some()
+    }
+
     /// Returns true if the stream is not storing incoming data.
     pub fn is_draining(&self) -> bool {
         self.drain
