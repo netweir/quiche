@@ -59,11 +59,9 @@ fn main() {
     // off) so rustc doesn't warn about unknown cfg names.
     println!("cargo::rustc-check-cfg=cfg(boring_v5)");
     if cfg!(feature = "boringssl-boring-crate") {
-        if std::env::var("DEP_BORINGSSL_VERSION_MAJOR").ok().as_deref() ==
-            Some("5")
-        {
-            println!("cargo:rustc-cfg=boring_v5");
-        }
+        // netweir: btls, in boring's place, sends post-quantum key shares by
+        // default as boring 5.x does, and doesn't export a major version.
+        println!("cargo:rustc-cfg=boring_v5");
         println!("cargo:rustc-link-lib=static=ssl");
         println!("cargo:rustc-link-lib=static=crypto");
     }

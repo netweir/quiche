@@ -1,18 +1,23 @@
 [workspace]
+# netweir builds only quiche and what it needs; the other crates take
+# boring's features, which btls doesn't have.
 members = [
+  "octets",
+  "qlog",
+  "quiche",
+]
+exclude = [
   "apps",
   "buffer-pool",
   "datagram-socket",
+  "fuzz",
   "h3i",
   "netlog",
-  "octets",
-  "qlog",
   "qlog-dancer",
-  "quiche",
   "task-killswitch",
   "tokio-quiche",
+  "tools/http3_test",
 ]
-exclude = ["fuzz", "tools/http3_test"]
 resolver = "2"
 
 [workspace.package]
@@ -55,8 +60,11 @@ assert_matches = { version = "1" }
 #
 # `boring-sys` uses `links = "boringssl"`, so only one major version
 # can ever be in the dep graph at a time.
-boring = { version = ">=4.19, <6" }
-boring-sys = { version = ">=4.19, <6" }
+# netweir: btls, the BoringSSL fork netweir's TCP connections use, in
+# boring's place. Both declare `links = "boringssl"`, so only one can be
+# in a build.
+boring = { package = "btls", version = "0.5.6" }
+boring-sys = { package = "btls-sys", version = "0.5.6" }
 buffer-pool = { version = "0.2.1", path = "./buffer-pool" }
 bytes = { version = "1.11.1" }
 clap = { version = "4" }
