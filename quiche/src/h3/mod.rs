@@ -600,6 +600,8 @@ pub struct Config {
     max_priority_update_size: u64,
 
     chromium: bool,
+
+    safari: bool,
 }
 
 impl Config {
@@ -614,6 +616,7 @@ impl Config {
             max_priority_update_size:
                 PRIORITY_UPDATE_FRAME_PAYLOAD_MAX_SIZE_DEFAULT,
             chromium: false,
+            safari: false,
         })
     }
 
@@ -636,6 +639,17 @@ impl Config {
     /// The default value is `false`.
     pub fn enable_chromium(&mut self, v: bool) {
         self.chromium = v;
+    }
+
+    /// netweir: opens a client's HTTP/3 connection as Safari 27 was
+    /// recorded opening it: as `enable_chromium` does, SETTINGS in
+    /// identifier order with one GREASE setting and the QPACK streams
+    /// left until they're needed, but with no GREASE frame after
+    /// SETTINGS and no SETTINGS_MAX_FIELD_SECTION_SIZE among them.
+    ///
+    /// The default value is `false`.
+    pub fn enable_safari(&mut self, v: bool) {
+        self.safari = v;
     }
 
     /// Sets the `SETTINGS_MAX_FIELD_SECTION_SIZE` setting.
@@ -1067,8 +1081,12 @@ pub struct Connection {
 
     max_priority_update_size: u64,
 
-    /// netweir: see `Config::enable_chromium`.
+    /// netweir: see `Config::enable_chromium`; also set by
+    /// `Config::enable_safari`.
     chromium: bool,
+
+    /// netweir: see `Config::enable_safari`.
+    safari: bool,
 
     /// netweir: request streams whose field section waits for dynamic
     /// table entries, with the section and whether the stream's FIN had
@@ -1141,7 +1159,9 @@ impl Connection {
 
             max_priority_update_size: config.max_priority_update_size,
 
-            chromium: config.chromium && !is_server,
+            chromium: (config.chromium || config.safari) && !is_server,
+
+            safari: config.safari && !is_server,
 
             blocked: hash_map::HashMap::new(),
 
@@ -2790,6 +2810,12 @@ impl Connection {
         ];
 
         for (id, value) in known {
+            // Safari sends no SETTINGS_MAX_FIELD_SECTION_SIZE; the limit
+            // still holds for what this side decodes.
+            if self.safari && id == frame::SETTINGS_MAX_FIELD_SECTION_SIZE {
+                continue;
+            }
+
             if let Some(value) = value {
                 settings.push((id, value));
             }
@@ -2814,12 +2840,15 @@ impl Connection {
         put_varint_vec(&mut out, payload.len() as u64);
         out.extend_from_slice(&payload);
 
-        let n = super::rand::rand_u64() as u32;
-        let mut grease = vec![0; (n % 4) as usize];
-        super::rand::rand_bytes(&mut grease);
-        put_varint_vec(&mut out, 0x1f * u64::from(n) + 0x21);
-        put_varint_vec(&mut out, grease.len() as u64);
-        out.extend_from_slice(&grease);
+        // Safari sends no GREASE frame.
+        if !self.safari {
+            let n = super::rand::rand_u64() as u32;
+            let mut grease = vec![0; (n % 4) as usize];
+            super::rand::rand_bytes(&mut grease);
+            put_varint_vec(&mut out, 0x1f * u64::from(n) + 0x21);
+            put_varint_vec(&mut out, grease.len() as u64);
+            out.extend_from_slice(&grease);
+        }
 
         if let Some(id) = self.control_stream_id {
             conn.stream_send(id, &out, false)?;
@@ -4438,6 +4467,44 @@ mod tests {
             qpack_insert(&mut s);
             assert_eq!(qpack_client_events(&mut s), vec![]);
             assert_eq!(qpack_decoder_stream(&mut s), vec![0x03, 0x40]);
+        }
+    }
+
+    // netweir: a client's control stream as Safari 27's: SETTINGS in
+    // order with one GREASE setting, and nothing after them.
+    #[test]
+    fn safari_settings() {
+        let (mut config, _) = Session::default_configs().unwrap();
+        config.enable_dgram(false, 0, 0);
+        let mut h3_config = Config::new().unwrap();
+        h3_config.set_qpack_max_table_capacity(16383);
+        h3_config.set_qpack_blocked_streams(100);
+        h3_config.enable_safari(true);
+
+        for _ in 0..8 {
+            let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
+            s.handshake().unwrap();
+
+            let raw = s.server.peer_settings_raw().unwrap().to_vec();
+            assert_eq!(raw.len(), 3, "{raw:?}");
+            assert_eq!(&raw[..2], &[(1, 16383), (7, 100)]);
+            assert!(raw[2].0 >= 0x21 && (raw[2].0 - 0x21) % 0x1f == 0);
+            assert!(raw[2].1 <= u64::from(u32::MAX));
+
+            assert_eq!(s.server.peer_qpack_streams.encoder_stream_id, None);
+            assert_eq!(s.server.peer_qpack_streams.decoder_stream_id, None);
+            assert!(s.client.safari && s.client.chromium);
+
+            // The control stream holds the stream type and SETTINGS, and
+            // nothing more: no GREASE frame.
+            let id = s.client.control_stream_id.unwrap();
+            let sent = s.pipe.client.streams.get(id).unwrap().send.off_back();
+            let settings_len: u64 = raw
+                .iter()
+                .map(|(i, v)| (octets::varint_len(*i) + octets::varint_len(*v)) as u64)
+                .sum();
+            let frame_len = 1 + octets::varint_len(settings_len) as u64 + settings_len;
+            assert_eq!(sent, 1 + frame_len);
         }
     }
 
