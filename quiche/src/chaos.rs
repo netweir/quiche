@@ -91,8 +91,8 @@ pub(crate) fn split_first_flight(
     }
 
     let first_occupied = max_other - max_first;
-    let num_packets = (write_len + first_occupied + max_other - 1) / max_other;
-    let in_other = (write_len + first_occupied + num_packets - 1) / num_packets;
+    let num_packets = (write_len + first_occupied).div_ceil(max_other);
+    let in_other = (write_len + first_occupied).div_ceil(num_packets);
 
     if in_other < first_occupied {
         return None;

@@ -84,6 +84,10 @@ commit with a test that failed before it:
 - Debug builds now assert that no packet number is sealed twice with the
   same key, the check plain AES-GCM doesn't make (7bf529a8).
 
+A response whose first frame is DATA, not HEADERS, now closes the
+connection with H3_FRAME_UNEXPECTED, as Chrome does; upstream reports it
+as data (a974dee3).
+
 The `qpack_dynamic` and `h3_client_qpack` fuzz targets in `fuzz/` cover
 the dynamic table and the client's event order.
 

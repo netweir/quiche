@@ -4518,7 +4518,7 @@ mod tests {
         h3_config.set_qpack_blocked_streams(100);
         h3_config.enable_chromium(true);
 
-        let mut greases = std::collections::HashSet::new();
+        let mut greases = HashSet::new();
         for _ in 0..8 {
             let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
             s.handshake().unwrap();
@@ -4528,7 +4528,8 @@ mod tests {
             let mut sorted = ids.clone();
             sorted.sort();
             assert_eq!(ids, sorted);
-            let is_grease = |id: u64| id >= 0x21 && (id - 0x21) % 0x1f == 0;
+            let is_grease =
+                |id: u64| id >= 0x21 && (id - 0x21).is_multiple_of(0x1f);
             let known: Vec<(u64, u64)> =
                 raw.iter().copied().filter(|(id, _)| !is_grease(*id)).collect();
             assert_eq!(known, vec![(1, 65536), (6, 262_144), (7, 100), (0x33, 1)]);
@@ -7876,6 +7877,36 @@ mod tests {
             h3_config
                 .set_additional_settings(vec![(frame::SETTINGS_H3_DATAGRAM, 43)]),
             Err(Error::SettingsError)
+        );
+    }
+
+    #[test]
+    /// Tests that a client rejects a DATA frame that arrives on a request
+    /// stream before any HEADERS.
+    fn data_before_headers_on_request_stream_client() {
+        let mut s = Session::new().unwrap();
+        s.handshake().unwrap();
+
+        let (stream, _req) = s.send_request(true).unwrap();
+
+        let data = frame::Frame::Data {
+            payload: vec![7; 10],
+        };
+        s.send_frame_server(data, stream, false).unwrap();
+
+        // The client MUST treat this as H3_FRAME_UNEXPECTED, not as Data.
+        assert_eq!(s.poll_client(), Err(Error::FrameUnexpected));
+        assert_eq!(
+            s.pipe.client.local_error(),
+            Some(&crate::ConnectionError {
+                is_app: true,
+                error_code: WireErrorCode::FrameUnexpected as u64,
+                reason: format!(
+                    "Unexpected frame type {}",
+                    frame::DATA_FRAME_TYPE_ID
+                )
+                .into_bytes(),
+            })
         );
     }
 

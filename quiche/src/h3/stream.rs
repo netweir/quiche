@@ -401,6 +401,19 @@ impl Stream {
         // HTTP message phase bookkeeping only applies to peer-initiated
         // streams, since it tracks the receive direction.
         if self.is_local {
+            // netweir: but a response's DATA before its HEADERS is
+            // H3_FRAME_UNEXPECTED (RFC 9114 section 4.1), as Chromium's
+            // QuicSpdyStream treats it.
+            match (ty, self.remote_initialized) {
+                (frame::HEADERS_FRAME_TYPE_ID, _) =>
+                    self.remote_initialized = true,
+
+                (frame::DATA_FRAME_TYPE_ID, false) =>
+                    return Err(Error::FrameUnexpected),
+
+                _ => (),
+            }
+
             return Ok(());
         }
 

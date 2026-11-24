@@ -11,8 +11,8 @@ use quiche::h3::Event;
 // netweir: an HTTP/3 client with a dynamic table, fed fuzzer-chosen bytes
 // on the server's encoder stream and on two response streams, with resets
 // from either side in between. No stream may report anything after its
-// Finished or Reset. (A DATA frame before any HEADERS is reported as Data,
-// as upstream quiche does, so Headers coming first isn't checked.)
+// Finished or Reset, and no stream may report Data before its Headers: a
+// DATA frame before any HEADERS closes the connection, as Chromium does.
 fuzz_target!(|data: &[u8]| {
     let (mut config, mut h3_config) = Session::default_configs().unwrap();
     h3_config.set_qpack_max_table_capacity(4096);
@@ -30,8 +30,9 @@ fuzz_target!(|data: &[u8]| {
     // The server's encoder stream follows its control stream.
     const ENCODER: u64 = 7;
 
-    // Per stream: whether it ended.
+    // Per stream: whether it ended, and whether its Headers came.
     let mut ended: HashMap<u64, bool> = HashMap::new();
+    let mut headers: HashMap<u64, bool> = HashMap::new();
 
     let mut rest = data;
     while rest.len() >= 2 {
@@ -72,7 +73,15 @@ fuzz_target!(|data: &[u8]| {
             let ended = ended.entry(id).or_default();
             assert!(!*ended, "{:?} on stream {} after it ended", ev, id);
             match ev {
+                Event::Headers { .. } => {
+                    headers.insert(id, true);
+                },
                 Event::Data => {
+                    assert!(
+                        headers.get(&id).copied().unwrap_or(false),
+                        "Data on stream {} before its Headers",
+                        id
+                    );
                     let mut b = [0; 1024];
                     let (client, conn) = (&mut s.client, &mut s.pipe.client);
                     while client.recv_body(conn, id, &mut b).is_ok() {}
