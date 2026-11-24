@@ -3106,6 +3106,12 @@ impl Connection {
                         Ok(ev) => return Ok(ev),
 
                         Err(Error::Done) => {
+                            // netweir: HEADERS waiting for dynamic table
+                            // entries; the frames after them wait too.
+                            if self.blocked.contains_key(&stream_id) {
+                                return Err(Error::Done);
+                            }
+
                             // Internal frames do not produce events. Avoid
                             // reading again if QUIC marked the stream finished.
                             if conn.stream_finished(stream_id) {
@@ -3418,8 +3424,12 @@ impl Connection {
                                 .qpack_blocked_streams
                                 .unwrap_or(0) =>
                     {
-                        self.blocked
+                        // The stream isn't read again until these are
+                        // decoded, so no later HEADERS can replace them.
+                        let earlier = self
+                            .blocked
                             .insert(stream_id, (header_block.to_vec(), payload_len));
+                        debug_assert!(earlier.is_none());
                         return Err(Error::Done);
                     },
 
@@ -4157,6 +4167,119 @@ mod tests {
         s.advance().ok();
         while s.poll_server().is_ok() {}
         assert_eq!(s.server.peer_qpack_streams.decoder_stream_bytes, 1);
+    }
+
+    // netweir: a session whose server compresses with a 4096-byte table,
+    // and a request stream the server has read. With `late_encoder` the
+    // server's encoder stream isn't open yet.
+    fn qpack_session(late_encoder: bool) -> (Session, u64) {
+        let (mut config, mut h3_config) = Session::default_configs().unwrap();
+        h3_config.set_qpack_max_table_capacity(4096);
+        h3_config.set_qpack_blocked_streams(10);
+        h3_config.enable_chromium(true);
+        let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
+
+        if late_encoder {
+            s.pipe.handshake().unwrap();
+            s.client.send_settings(&mut s.pipe.client).unwrap();
+            s.pipe.advance().ok();
+            s.server.send_settings(&mut s.pipe.server).unwrap();
+            s.pipe.advance().ok();
+            while s.client.poll(&mut s.pipe.client).is_ok() {}
+            while s.server.poll(&mut s.pipe.server).is_ok() {}
+        } else {
+            s.handshake().unwrap();
+        }
+
+        let (stream, _) = s.send_request(true).unwrap();
+        loop {
+            match s.poll_server() {
+                Ok((_, Event::Headers { .. })) => break,
+                Ok(_) => continue,
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+
+        (s, stream)
+    }
+
+    // netweir: Required Insert Count 1, Base 1, Indexed dynamic 0, then
+    // :status 200 from the static table.
+    fn qpack_blocked_headers(s: &mut Session, stream: u64, fin: bool) {
+        s.send_frame_server(
+            frame::Frame::Headers {
+                header_block: vec![0x02, 0x00, 0x80, 0xd9],
+            },
+            stream,
+            fin,
+        )
+        .unwrap();
+    }
+
+    // netweir: the entry `qpack_blocked_headers` waits for.
+    fn qpack_insert(s: &mut Session) {
+        if s.server.local_qpack_streams.encoder_stream_id.is_none() {
+            s.server.open_qpack_encoder_stream(&mut s.pipe.server).unwrap();
+        }
+        let encoder = s.server.local_qpack_streams.encoder_stream_id.unwrap();
+        let mut instructions = vec![0x3f, 0xbd, 0x01, 0x4a];
+        instructions.extend_from_slice(b"custom-key");
+        instructions.push(0x0c);
+        instructions.extend_from_slice(b"custom-value");
+        s.pipe.server.stream_send(encoder, &instructions, false).unwrap();
+        s.advance().ok();
+    }
+
+    // netweir: the client's events until it has none, its body read.
+    fn qpack_client_events(s: &mut Session) -> Vec<(u64, Event)> {
+        let mut events = Vec::new();
+        loop {
+            match s.poll_client() {
+                Ok((id, Event::Data)) => {
+                    let mut b = [0; 100];
+                    let (client, conn) = (&mut s.client, &mut s.pipe.client);
+                    while client.recv_body(conn, id, &mut b).is_ok() {}
+                    events.push((id, Event::Data));
+                },
+                Ok(ev) => events.push(ev),
+                Err(Error::Done) => return events,
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+    }
+
+    fn qpack_headers(more_frames: bool) -> Event {
+        Event::Headers {
+            list: vec![
+                Header::new(b"custom-key", b"custom-value"),
+                Header::new(b":status", b"200"),
+            ],
+            more_frames,
+        }
+    }
+
+    // netweir: a DATA frame after HEADERS that wait for the encoder stream
+    // isn't read before them.
+    #[test]
+    fn qpack_blocked_headers_before_data() {
+        let (mut s, stream) = qpack_session(false);
+        qpack_blocked_headers(&mut s, stream, false);
+        s.send_frame_server(
+            frame::Frame::Data {
+                payload: vec![7; 10],
+            },
+            stream,
+            true,
+        )
+        .unwrap();
+        assert_eq!(s.poll_client(), Err(Error::Done));
+
+        qpack_insert(&mut s);
+        assert_eq!(qpack_client_events(&mut s), vec![
+            (stream, qpack_headers(true)),
+            (stream, Event::Data),
+            (stream, Event::Finished),
+        ]);
     }
 
     // netweir: a client's control stream and PRIORITY_UPDATE as Chrome's.
