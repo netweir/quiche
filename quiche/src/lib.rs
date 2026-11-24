@@ -962,6 +962,32 @@ impl Config {
             cmp::min(v, octets::MAX_VAR_INT);
     }
 
+    /// netweir: writes the transport parameters as Chromium's QUIC does
+    /// (transport_parameters.cc, SerializeTransportParameters): in a new
+    /// random order on each connection, with one GREASE parameter of 0 to
+    /// 15 random bytes, a GREASE version at a random place in
+    /// version_information, and integer parameters that hold their default
+    /// value left out. Clients only.
+    ///
+    /// The default value is `false`.
+    pub fn enable_chromium_transport_params(&mut self, v: bool) {
+        self.local_transport_params.chromium_encoding = v;
+    }
+
+    /// netweir: sends the version_information transport parameter (RFC
+    /// 9368) with this connection's version as the chosen one and
+    /// `available` as the others.
+    pub fn set_version_information(&mut self, available: &[u32]) {
+        self.local_transport_params.version_information =
+            Some((self.version, available.to_vec()));
+    }
+
+    /// netweir: sends a transport parameter quiche doesn't know, as given,
+    /// such as Chromium's google_connection_options (0x3128).
+    pub fn add_custom_transport_param(&mut self, id: u64, value: &[u8]) {
+        self.local_transport_params.custom.push((id, value.to_vec()));
+    }
+
     /// Sets the `max_udp_payload_size transport` parameter.
     ///
     /// The default value is `65527`.

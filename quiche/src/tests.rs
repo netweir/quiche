@@ -96,6 +96,9 @@ fn transport_params() {
         retry_source_connection_id: Some(b"retry".to_vec().into()),
         max_datagram_frame_size: Some(32),
         unknown_params: Default::default(),
+        chromium_encoding: false,
+        version_information: None,
+        custom: Vec::new(),
     };
 
     let mut raw_params = [42; 256];
@@ -126,6 +129,9 @@ fn transport_params() {
         retry_source_connection_id: None,
         max_datagram_frame_size: Some(32),
         unknown_params: Default::default(),
+        chromium_encoding: false,
+        version_information: None,
+        custom: Vec::new(),
     };
 
     let mut raw_params = [42; 256];
@@ -136,6 +142,67 @@ fn transport_params() {
     let new_tp = TransportParams::decode(raw_params, true, None).unwrap();
 
     assert_eq!(new_tp, tp);
+}
+
+// netweir: a client writing its parameters as Chromium does.
+#[test]
+fn transport_params_chromium_encoding() {
+    let tp = TransportParams {
+        max_idle_timeout: 30_000,
+        max_udp_payload_size: 1472,
+        initial_max_data: 15_728_640,
+        initial_max_stream_data_bidi_local: 6_291_456,
+        initial_max_stream_data_bidi_remote: 6_291_456,
+        initial_max_stream_data_uni: 6_291_456,
+        initial_max_streams_bidi: 100,
+        initial_max_streams_uni: 103,
+        initial_source_connection_id: Some(Vec::new().into()),
+        max_datagram_frame_size: Some(65_536),
+        chromium_encoding: true,
+        version_information: Some((1, vec![1])),
+        custom: vec![(0x3128, b"ORIG".to_vec())],
+        ..Default::default()
+    };
+
+    let mut orders = std::collections::HashSet::new();
+    let mut grease_at = std::collections::HashSet::new();
+    for _ in 0..64 {
+        let mut raw = [0; 512];
+        let raw = TransportParams::encode(&tp, false, &mut raw).unwrap();
+        let mut b = octets::Octets::with_slice(raw);
+        let (mut ids, mut grease) = (Vec::new(), Vec::new());
+        while b.cap() > 0 {
+            let id = b.get_varint().unwrap();
+            let value = b.get_bytes_with_varint_length().unwrap().to_vec();
+            if id % 31 == 27 && id > 0x3128 {
+                assert!(value.len() < 16);
+                grease.push(id);
+                continue;
+            }
+            if id == 0x11 {
+                assert_eq!(value.len(), 12);
+                assert_eq!(&value[..4], &[0, 0, 0, 1]);
+                let at = if value[4..8] == [0, 0, 0, 1] { 1 } else { 0 };
+                let g = &value[4 + 4 * at..8 + 4 * at];
+                assert!(g.iter().all(|b| b & 0x0f == 0x0a));
+                grease_at.insert(at);
+            }
+            ids.push(id);
+        }
+        assert_eq!(grease.len(), 1);
+        let mut sorted = ids.clone();
+        sorted.sort();
+        // No ack_delay_exponent, max_ack_delay or active_connection_id_limit:
+        // they hold their defaults.
+        assert_eq!(sorted, vec![1, 3, 4, 5, 6, 7, 8, 9, 0xf, 0x11, 0x20, 0x3128]);
+        orders.insert(ids);
+
+        // Still decodable.
+        let decoded = TransportParams::decode(raw, true, None).unwrap();
+        assert_eq!(decoded.initial_max_streams_uni, 103);
+    }
+    assert!(orders.len() > 32);
+    assert_eq!(grease_at.len(), 2);
 }
 
 #[test]

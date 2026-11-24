@@ -192,6 +192,18 @@ pub struct TransportParams {
     /// Unknown peer transport parameters and values, if any.
     pub unknown_params: Option<UnknownTransportParameters>,
     // pub preferred_address: ...,
+    /// netweir: a client writes its parameters as Chromium's QUIC does
+    /// (transport_parameters.cc, SerializeTransportParameters): in a new
+    /// random order on each connection, with one GREASE parameter, a
+    /// GREASE version in `version_information`, and integer parameters left
+    /// out when they hold their default value.
+    pub chromium_encoding: bool,
+    /// netweir: the version_information parameter (RFC 9368) to send, as
+    /// the chosen version and the available ones. Never decoded.
+    pub version_information: Option<(u32, Vec<u32>)>,
+    /// netweir: parameters sent as given, after the known ones. Never
+    /// decoded.
+    pub custom: Vec<(u64, Vec<u8>)>,
 }
 
 impl Default for TransportParams {
@@ -215,6 +227,9 @@ impl Default for TransportParams {
             retry_source_connection_id: None,
             max_datagram_frame_size: None,
             unknown_params: Default::default(),
+            chromium_encoding: false,
+            version_information: None,
+            custom: Vec::new(),
         }
     }
 }
@@ -402,160 +417,145 @@ impl TransportParams {
     pub(crate) fn encode<'a>(
         tp: &TransportParams, is_server: bool, out: &'a mut [u8],
     ) -> Result<&'a mut [u8]> {
-        let mut b = octets::OctetsMut::with_slice(out);
+        // netweir: each parameter is collected first, so that a client can
+        // write them as Chromium's QUIC does (see `chromium_encoding`).
+        let mut params: Vec<(u64, Vec<u8>)> = Vec::new();
+        let chromium = tp.chromium_encoding && !is_server;
+
+        let varint = |v: u64| -> Result<Vec<u8>> {
+            assert!(v <= octets::MAX_VAR_INT);
+            let mut d = [0; 8];
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+            b.put_varint(v)?;
+            let len = b.off();
+            Ok(d[..len].to_vec())
+        };
 
         if is_server {
             if let Some(ref odcid) = tp.original_destination_connection_id {
-                TransportParams::encode_param(&mut b, 0x0000, odcid.len())?;
-                b.put_bytes(odcid)?;
+                params.push((0x0000, odcid.to_vec()));
             }
         };
 
         if tp.max_idle_timeout != 0 {
-            assert!(tp.max_idle_timeout <= octets::MAX_VAR_INT);
-            TransportParams::encode_param(
-                &mut b,
-                0x0001,
-                octets::varint_len(tp.max_idle_timeout),
-            )?;
-            b.put_varint(tp.max_idle_timeout)?;
+            params.push((0x0001, varint(tp.max_idle_timeout)?));
         }
 
         if is_server {
             if let Some(ref token) = tp.stateless_reset_token {
-                TransportParams::encode_param(&mut b, 0x0002, 16)?;
-                b.put_bytes(&token.to_be_bytes())?;
+                params.push((0x0002, token.to_be_bytes().to_vec()));
             }
         }
 
-        if tp.max_udp_payload_size != 0 {
-            assert!(tp.max_udp_payload_size <= octets::MAX_VAR_INT);
-            TransportParams::encode_param(
-                &mut b,
-                0x0003,
-                octets::varint_len(tp.max_udp_payload_size),
-            )?;
-            b.put_varint(tp.max_udp_payload_size)?;
+        // Chromium leaves out an integer parameter holding its default
+        // value (IntegerParameter::Write).
+        if tp.max_udp_payload_size != 0 &&
+            !(chromium && tp.max_udp_payload_size == 65527)
+        {
+            params.push((0x0003, varint(tp.max_udp_payload_size)?));
         }
 
         if tp.initial_max_data != 0 {
-            assert!(tp.initial_max_data <= octets::MAX_VAR_INT);
-            TransportParams::encode_param(
-                &mut b,
-                0x0004,
-                octets::varint_len(tp.initial_max_data),
-            )?;
-            b.put_varint(tp.initial_max_data)?;
+            params.push((0x0004, varint(tp.initial_max_data)?));
         }
 
         if tp.initial_max_stream_data_bidi_local != 0 {
-            assert!(tp.initial_max_stream_data_bidi_local <= octets::MAX_VAR_INT);
-            TransportParams::encode_param(
-                &mut b,
-                0x0005,
-                octets::varint_len(tp.initial_max_stream_data_bidi_local),
-            )?;
-            b.put_varint(tp.initial_max_stream_data_bidi_local)?;
+            params.push((0x0005, varint(tp.initial_max_stream_data_bidi_local)?));
         }
 
         if tp.initial_max_stream_data_bidi_remote != 0 {
-            assert!(
-                tp.initial_max_stream_data_bidi_remote <= octets::MAX_VAR_INT
-            );
-            TransportParams::encode_param(
-                &mut b,
-                0x0006,
-                octets::varint_len(tp.initial_max_stream_data_bidi_remote),
-            )?;
-            b.put_varint(tp.initial_max_stream_data_bidi_remote)?;
+            params
+                .push((0x0006, varint(tp.initial_max_stream_data_bidi_remote)?));
         }
 
         if tp.initial_max_stream_data_uni != 0 {
-            assert!(tp.initial_max_stream_data_uni <= octets::MAX_VAR_INT);
-            TransportParams::encode_param(
-                &mut b,
-                0x0007,
-                octets::varint_len(tp.initial_max_stream_data_uni),
-            )?;
-            b.put_varint(tp.initial_max_stream_data_uni)?;
+            params.push((0x0007, varint(tp.initial_max_stream_data_uni)?));
         }
 
         if tp.initial_max_streams_bidi != 0 {
-            assert!(tp.initial_max_streams_bidi <= octets::MAX_VAR_INT);
-            TransportParams::encode_param(
-                &mut b,
-                0x0008,
-                octets::varint_len(tp.initial_max_streams_bidi),
-            )?;
-            b.put_varint(tp.initial_max_streams_bidi)?;
+            params.push((0x0008, varint(tp.initial_max_streams_bidi)?));
         }
 
         if tp.initial_max_streams_uni != 0 {
-            assert!(tp.initial_max_streams_uni <= octets::MAX_VAR_INT);
-            TransportParams::encode_param(
-                &mut b,
-                0x0009,
-                octets::varint_len(tp.initial_max_streams_uni),
-            )?;
-            b.put_varint(tp.initial_max_streams_uni)?;
+            params.push((0x0009, varint(tp.initial_max_streams_uni)?));
         }
 
-        if tp.ack_delay_exponent != 0 {
+        if tp.ack_delay_exponent != 0 && !(chromium && tp.ack_delay_exponent == 3)
+        {
             assert!(tp.ack_delay_exponent <= MAX_ACK_DELAY_EXPONENT);
-            TransportParams::encode_param(
-                &mut b,
-                0x000a,
-                octets::varint_len(tp.ack_delay_exponent),
-            )?;
-            b.put_varint(tp.ack_delay_exponent)?;
+            params.push((0x000a, varint(tp.ack_delay_exponent)?));
         }
 
-        if tp.max_ack_delay != 0 {
-            assert!(tp.max_ack_delay <= octets::MAX_VAR_INT);
-            TransportParams::encode_param(
-                &mut b,
-                0x000b,
-                octets::varint_len(tp.max_ack_delay),
-            )?;
-            b.put_varint(tp.max_ack_delay)?;
+        if tp.max_ack_delay != 0 && !(chromium && tp.max_ack_delay == 25) {
+            params.push((0x000b, varint(tp.max_ack_delay)?));
         }
 
         if tp.disable_active_migration {
-            TransportParams::encode_param(&mut b, 0x000c, 0)?;
+            params.push((0x000c, Vec::new()));
         }
 
         // TODO: encode preferred_address
 
         if tp.active_conn_id_limit != 2 {
-            assert!(tp.active_conn_id_limit <= octets::MAX_VAR_INT);
-            TransportParams::encode_param(
-                &mut b,
-                0x000e,
-                octets::varint_len(tp.active_conn_id_limit),
-            )?;
-            b.put_varint(tp.active_conn_id_limit)?;
+            params.push((0x000e, varint(tp.active_conn_id_limit)?));
         }
 
         if let Some(scid) = &tp.initial_source_connection_id {
-            TransportParams::encode_param(&mut b, 0x000f, scid.len())?;
-            b.put_bytes(scid)?;
+            params.push((0x000f, scid.to_vec()));
         }
 
         if is_server {
             if let Some(scid) = &tp.retry_source_connection_id {
-                TransportParams::encode_param(&mut b, 0x0010, scid.len())?;
-                b.put_bytes(scid)?;
+                params.push((0x0010, scid.to_vec()));
             }
         }
 
         if let Some(max_datagram_frame_size) = tp.max_datagram_frame_size {
-            assert!(max_datagram_frame_size <= octets::MAX_VAR_INT);
-            TransportParams::encode_param(
-                &mut b,
-                0x0020,
-                octets::varint_len(max_datagram_frame_size),
-            )?;
-            b.put_varint(max_datagram_frame_size)?;
+            params.push((0x0020, varint(max_datagram_frame_size)?));
+        }
+
+        // netweir: version_information (RFC 9368), with one GREASE version
+        // at a random place among the available ones, as Chromium writes it
+        // (SerializeTransportParameters, CreateQuicVersionLabel for
+        // QuicVersionReservedForNegotiation).
+        if let Some((chosen, available)) = &tp.version_information {
+            let mut versions = available.clone();
+            if chromium {
+                let at = crate::rand::rand_u64() % (versions.len() as u64 + 1);
+                let grease =
+                    (crate::rand::rand_u64() as u32 & 0xf0f0_f0f0) | 0x0a0a_0a0a;
+                versions.insert(at as usize, grease);
+            }
+            let mut value = chosen.to_be_bytes().to_vec();
+            for v in versions {
+                value.extend_from_slice(&v.to_be_bytes());
+            }
+            params.push((0x0011, value));
+        }
+
+        params.extend(tp.custom.iter().cloned());
+
+        if chromium {
+            // One reserved parameter, 31 * N + 27, with 0 to 15 random
+            // bytes (RFC 9000, Section 18.1), and every parameter in a
+            // random order, both new on each connection.
+            let id = crate::rand::rand_u64() % ((1 << 62) - 31);
+            let id = (id / 31) * 31 + 27;
+            let mut value = vec![0; (crate::rand::rand_u64() % 16) as usize];
+            crate::rand::rand_bytes(&mut value);
+            params.push((id, value));
+
+            for i in (1..params.len()).rev() {
+                let j = (crate::rand::rand_u64() % (i as u64 + 1)) as usize;
+                params.swap(i, j);
+            }
+        }
+
+        let mut b = octets::OctetsMut::with_slice(out);
+
+        for (id, value) in &params {
+            TransportParams::encode_param(&mut b, *id, value.len())?;
+            b.put_bytes(value)?;
         }
 
         let out_len = b.off();
