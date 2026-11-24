@@ -2272,6 +2272,13 @@ impl Connection {
             if let Some(ev) = ev {
                 return Ok(ev);
             }
+
+            // netweir: an encoder stream read here may have unblocked
+            // field sections; they go out before any stream is read
+            // further or reported finished.
+            if let Some(ev) = self.unblocked.pop_front() {
+                return Ok(ev);
+            }
         }
 
         // Process finished streams list once again, to make sure `Finished`
@@ -3302,12 +3309,12 @@ impl Connection {
     fn pop_finished_stream<F: BufFactory>(
         &mut self, conn: &mut super::Connection<F>,
     ) -> Option<(u64, Event)> {
-        // netweir: a stream waiting for dynamic table entries finishes
-        // after its headers.
-        let at = self
-            .finished_streams
-            .iter()
-            .position(|id| !self.blocked.contains_key(id))?;
+        // netweir: a stream waiting for dynamic table entries, or whose
+        // decoded headers are still queued, finishes after its headers.
+        let at = self.finished_streams.iter().position(|id| {
+            !self.blocked.contains_key(id) &&
+                !self.unblocked.iter().any(|(s, _)| s == id)
+        })?;
         let finished = self.finished_streams.remove(at)?;
 
         self.remove_local_finished_stream(finished);
@@ -4280,6 +4287,37 @@ mod tests {
             (stream, Event::Data),
             (stream, Event::Finished),
         ]);
+    }
+
+    // netweir: with the encoder stream opened by the instructions that
+    // unblock a stream, its headers still come before its later events.
+    #[test]
+    fn qpack_late_encoder_stream_event_order() {
+        for body in [false, true] {
+            let (mut s, stream) = qpack_session(true);
+            qpack_blocked_headers(&mut s, stream, !body);
+            if body {
+                s.send_frame_server(
+                    frame::Frame::Data { payload: vec![7; 10] },
+                    stream,
+                    true,
+                )
+                .unwrap();
+            }
+            assert_eq!(s.poll_client(), Err(Error::Done));
+
+            qpack_insert(&mut s);
+            let expected = if body {
+                vec![
+                    (stream, qpack_headers(true)),
+                    (stream, Event::Data),
+                    (stream, Event::Finished),
+                ]
+            } else {
+                vec![(stream, qpack_headers(false)), (stream, Event::Finished)]
+            };
+            assert_eq!(qpack_client_events(&mut s), expected, "body {body}");
+        }
     }
 
     // netweir: a client's control stream and PRIORITY_UPDATE as Chrome's.
