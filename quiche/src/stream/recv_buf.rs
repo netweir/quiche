@@ -421,11 +421,7 @@ impl RecvBuf {
     /// This happens when the stream's receive final size is known, and the
     /// application has read all data from the stream.
     pub fn is_fin(&self) -> bool {
-        if self.fin_off == Some(self.off) {
-            return true;
-        }
-
-        false
+        self.fin_off == Some(self.off)
     }
 
     /// netweir: returns true if the peer reset the stream.

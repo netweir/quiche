@@ -4451,7 +4451,7 @@ mod tests {
         h3_config.set_qpack_blocked_streams(100);
         h3_config.enable_chromium(true);
 
-        let mut greases = std::collections::HashSet::new();
+        let mut greases = HashSet::new();
         for _ in 0..8 {
             let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
             s.handshake().unwrap();
@@ -4461,7 +4461,8 @@ mod tests {
             let mut sorted = ids.clone();
             sorted.sort();
             assert_eq!(ids, sorted);
-            let is_grease = |id: u64| id >= 0x21 && (id - 0x21) % 0x1f == 0;
+            let is_grease =
+                |id: u64| id >= 0x21 && (id - 0x21).is_multiple_of(0x1f);
             let known: Vec<(u64, u64)> =
                 raw.iter().copied().filter(|(id, _)| !is_grease(*id)).collect();
             assert_eq!(known, vec![(1, 65536), (6, 262_144), (7, 100), (0x33, 1)]);
