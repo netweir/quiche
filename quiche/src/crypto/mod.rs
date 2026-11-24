@@ -224,6 +224,9 @@ pub struct Seal {
     header: HeaderProtectionKey,
 
     packet: PacketKey,
+
+    /// netweir: the last packet number sealed with this key.
+    last_counter: Option<u64>,
 }
 
 impl Seal {
@@ -244,6 +247,8 @@ impl Seal {
             header: HeaderProtectionKey::new(alg, hp_key)?,
 
             packet: PacketKey::new(alg, key, iv, Self::ENCRYPT)?,
+
+            last_counter: None,
         })
     }
 
@@ -256,6 +261,8 @@ impl Seal {
             header: HeaderProtectionKey::from_secret(aead, secret)?,
 
             packet: PacketKey::from_secret(aead, secret, Self::ENCRYPT)?,
+
+            last_counter: None,
         })
     }
 
@@ -285,6 +292,8 @@ impl Seal {
             header: self.header.clone(),
 
             packet: next_packet_key,
+
+            last_counter: None,
         })
     }
 
@@ -292,6 +301,16 @@ impl Seal {
         &mut self, counter: u64, ad: &[u8], buf: &mut [u8], in_len: usize,
         extra_in: Option<&[u8]>,
     ) -> Result<usize> {
+        // netweir: a nonce must never be used twice with a key. BoringSSL's
+        // TLS 1.3 AES-GCM checked that its counters rose; the plain AES-GCM
+        // used for Chrome's packet numbers doesn't, so check it here.
+        debug_assert!(
+            self.last_counter.is_none_or(|last| counter > last),
+            "packet number {counter} sealed after {:?}",
+            self.last_counter
+        );
+        self.last_counter = Some(counter);
+
         if cfg!(feature = "fuzzing") {
             let tag_len = self.alg.tag_len();
 
@@ -531,6 +550,20 @@ extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // netweir: sealing a packet number that isn't above the last one
+    // would reuse a nonce.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "packet number 1 sealed after Some(1)")]
+    fn seal_packet_number_reused() {
+        let mut seal =
+            Seal::from_secret(Algorithm::AES128_GCM, &[0; 32]).unwrap();
+        let mut buf = [0; 32];
+        seal.seal_with_u64_counter(0, b"", &mut buf, 0, None).unwrap();
+        seal.seal_with_u64_counter(1, b"", &mut buf, 0, None).unwrap();
+        seal.seal_with_u64_counter(1, b"", &mut buf, 0, None).unwrap();
+    }
 
     #[test]
     fn derive_initial_secrets_v1() {
