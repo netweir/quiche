@@ -67,6 +67,10 @@ pub enum Error {
     /// netweir: an encoder instruction couldn't be applied (RFC 9204,
     /// Section 4.3): QPACK_ENCODER_STREAM_ERROR.
     EncoderStream,
+
+    /// netweir: a prefixed integer didn't fit in 64 bits (RFC 9204,
+    /// Section 4.1.1).
+    IntegerOverflow,
 }
 
 impl std::fmt::Display for Error {

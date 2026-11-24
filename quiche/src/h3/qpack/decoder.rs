@@ -552,12 +552,17 @@ fn decode_int(b: &mut octets::Octets, prefix: usize) -> Result<u64> {
 
     while b.cap() > 0 {
         let byte = b.get_u8()?;
+        let bits = u64::from(byte & 0x7f);
 
-        let inc = u64::from(byte & 0x7f)
-            .checked_shl(shift)
-            .ok_or(Error::BufferTooShort)?;
+        // netweir: overflow is the peer's error, not more data to wait
+        // for, and no bit of the 10th byte may be shifted out of a u64.
+        if shift >= u64::BITS || bits > u64::MAX >> shift {
+            return Err(Error::IntegerOverflow);
+        }
 
-        val = val.checked_add(inc).ok_or(Error::BufferTooShort)?;
+        val = val
+            .checked_add(bits << shift)
+            .ok_or(Error::IntegerOverflow)?;
 
         shift += 7;
 
@@ -774,6 +779,51 @@ mod tests {
         let mut b = octets::Octets::with_slice(&encoded);
 
         assert_eq!(decode_int(&mut b, 8), Ok(42));
+    }
+
+    // netweir: an integer too large for a u64 is an error, not a wait for
+    // more bytes, whether its excess is in an 11th byte or in high bits of
+    // the 10th.
+    #[test]
+    fn decode_int_overflow() {
+        let mut long = vec![0x1f];
+        long.extend_from_slice(&[0x80; 10]);
+        long.push(0x01);
+        let mut b = octets::Octets::with_slice(&long);
+        assert_eq!(decode_int(&mut b, 5), Err(Error::IntegerOverflow));
+
+        let mut high = vec![0x1f];
+        high.extend_from_slice(&[0x80; 9]);
+        high.push(0x02);
+        let mut b = octets::Octets::with_slice(&high);
+        assert_eq!(decode_int(&mut b, 5), Err(Error::IntegerOverflow));
+
+        // The largest that fits: 31 + (2^64 - 32).
+        let mut max = vec![0x1f, 0xe0];
+        max.extend_from_slice(&[0xff; 8]);
+        max.push(0x01);
+        let mut b = octets::Octets::with_slice(&max);
+        assert_eq!(decode_int(&mut b, 5), Ok(u64::MAX));
+    }
+
+    // netweir: an encoder instruction with an integer too large is
+    // QPACK_ENCODER_STREAM_ERROR rather than held, which would stall the
+    // stream, and in a field section it fails decoding.
+    #[test]
+    fn integer_overflow_is_an_error() {
+        let mut d = Decoder::with_max_table_capacity(4096);
+        let mut bad = vec![0x3f];
+        bad.extend_from_slice(&[0x80; 11]);
+        bad.push(0x01);
+        assert_eq!(d.control(&mut bad), Err(Error::EncoderStream));
+
+        let mut section = vec![0x00, 0x00, 0x5f];
+        section.extend_from_slice(&[0x80; 11]);
+        section.push(0x01);
+        assert_eq!(
+            Decoder::new().decode(&section, u64::MAX),
+            Err(Error::IntegerOverflow)
+        );
     }
 
     /// LiteralWithNameRef with the dynamic table flag (S=0) must be
