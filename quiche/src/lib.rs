@@ -8220,6 +8220,16 @@ impl<F: BufFactory> Connection<F> {
         Some(&self.peer_transport_params)
     }
 
+    /// netweir: the connection's BoringSSL handle, for the settings
+    /// BoringSSL takes only per connection, such as ECH GREASE, key shares
+    /// and ALPS. Changes reach the ClientHello if made before the first
+    /// call to `send()`.
+    #[cfg(feature = "boringssl-boring-crate")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "boringssl-boring-crate")))]
+    pub fn ssl_mut(&mut self) -> &mut boring::ssl::SslRef {
+        self.handshake.ssl_mut()
+    }
+
     /// Collects and returns statistics about each known path for the
     /// connection.
     pub fn path_stats(&self) -> impl Iterator<Item = PathStats> + '_ {
