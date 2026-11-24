@@ -97,6 +97,7 @@ fn transport_params() {
         max_datagram_frame_size: Some(32),
         unknown_params: Default::default(),
         chromium_encoding: false,
+        safari_encoding: false,
         version_information: None,
         custom: Vec::new(),
     };
@@ -130,6 +131,7 @@ fn transport_params() {
         max_datagram_frame_size: Some(32),
         unknown_params: Default::default(),
         chromium_encoding: false,
+        safari_encoding: false,
         version_information: None,
         custom: Vec::new(),
     };
@@ -14880,4 +14882,107 @@ fn chromium_initial_flight_first_packets_lost() {
     assert!(pipe.client.is_established());
     assert_eq!(pipe.client.local_error(), None);
     assert_eq!(pipe.server.local_error(), None);
+}
+
+// netweir: a client writing its parameters as Safari 27 was recorded
+// writing them: ascending from a random one, no GREASE, defaults left out.
+#[test]
+fn transport_params_safari_encoding() {
+    let tp = TransportParams {
+        initial_max_data: 16_777_216,
+        initial_max_stream_data_bidi_local: 2_097_152,
+        initial_max_stream_data_bidi_remote: 2_097_152,
+        initial_max_stream_data_uni: 2_097_152,
+        initial_max_streams_uni: 8,
+        active_conn_id_limit: 64,
+        initial_source_connection_id: Some(Vec::new().into()),
+        safari_encoding: true,
+        ..Default::default()
+    };
+
+    let ascending = [4, 5, 6, 7, 9, 0xe, 0xf];
+    let mut starts = std::collections::HashSet::new();
+    for _ in 0..200 {
+        let mut raw = [0; 256];
+        let raw = TransportParams::encode(&tp, false, &mut raw).unwrap();
+        let mut b = octets::Octets::with_slice(raw);
+        let mut ids = Vec::new();
+        while b.cap() > 0 {
+            ids.push(b.get_varint().unwrap());
+            b.get_bytes_with_varint_length().unwrap();
+        }
+        let at = ascending.iter().position(|&id| id == ids[0]).unwrap();
+        let mut rotated = ascending.to_vec();
+        rotated.rotate_left(at);
+        assert_eq!(ids, rotated);
+        starts.insert(at);
+
+        let decoded = TransportParams::decode(raw, true, None).unwrap();
+        assert_eq!(decoded.active_conn_id_limit, 64);
+        assert_eq!(decoded.max_ack_delay, 25);
+    }
+    assert_eq!(starts.len(), ascending.len());
+}
+
+// netweir: a client's first flight laid out as Safari 27's was recorded:
+// 1200-byte datagrams, at most 999 bytes of the hello in each Initial,
+// one CRYPTO frame and then PADDING frames, packet numbers from 0.
+#[test]
+fn safari_initial_flight() {
+    let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+    config.enable_safari_initial(true);
+    // A hello longer than one packet's 999 bytes.
+    let long = [b'x'; 255];
+    config
+        .set_application_protos(&[&long, &long, b"proto1"])
+        .unwrap();
+
+    let mut pipe = test_utils::Pipe::with_client_config(&mut config).unwrap();
+
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    assert_eq!(flight.len(), 2);
+    let copies: Vec<Vec<u8>> = flight.iter().map(|(d, _)| d.clone()).collect();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    let mut at = 0;
+    for (i, mut datagram) in copies.into_iter().enumerate() {
+        assert_eq!(datagram.len(), 1200);
+        let mut b = octets::OctetsMut::with_slice(&mut datagram);
+        let mut hdr = Header::from_bytes(&mut b, 16).unwrap();
+        assert_eq!(hdr.ty, Type::Initial);
+        let len = b.get_varint().unwrap() as usize;
+        // The packet fills the datagram: no zero bytes after it.
+        assert_eq!(b.off() + len, 1200);
+        let aead = pipe.server.crypto_ctx[packet::Epoch::Initial]
+            .crypto_open
+            .as_ref()
+            .unwrap();
+        packet::decrypt_hdr(&mut b, &mut hdr, aead).unwrap();
+        assert_eq!((hdr.pkt_num, hdr.pkt_num_len), (i as u64, 1));
+        let mut payload =
+            packet::decrypt_pkt(&mut b, hdr.pkt_num, hdr.pkt_num_len, len, aead)
+                .unwrap();
+        let mut frames = Vec::new();
+        while payload.cap() > 0 {
+            frames.push(frame::Frame::from_bytes(&mut payload, hdr.ty).unwrap());
+        }
+        match &frames[..] {
+            [frame::Frame::Crypto { data }, rest @ ..] => {
+                assert_eq!(data.off(), at);
+                if i == 0 {
+                    assert_eq!(data.len(), 999);
+                }
+                at += data.len() as u64;
+                assert!(!rest.is_empty());
+                assert!(rest
+                    .iter()
+                    .all(|f| matches!(f, frame::Frame::Padding { .. })));
+            },
+            other => panic!("unexpected frames {other:?}"),
+        }
+    }
+    assert!(at > 999);
+
+    assert_eq!(pipe.advance(), Ok(()));
+    assert!(pipe.client.is_established());
 }

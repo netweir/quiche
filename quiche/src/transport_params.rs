@@ -198,6 +198,12 @@ pub struct TransportParams {
     /// GREASE version in `version_information`, and integer parameters left
     /// out when they hold their default value.
     pub chromium_encoding: bool,
+    /// netweir: a client writes its parameters as Safari 27's QUIC
+    /// (Apple's Network.framework) was recorded writing them: in
+    /// ascending order of id from a random one, wrapping round, with no
+    /// GREASE parameter, and integer parameters left out when they hold
+    /// their default value.
+    pub safari_encoding: bool,
     /// netweir: the version_information parameter (RFC 9368) to send, as
     /// the chosen version and the available ones. Never decoded.
     pub version_information: Option<(u32, Vec<u32>)>,
@@ -228,6 +234,7 @@ impl Default for TransportParams {
             max_datagram_frame_size: None,
             unknown_params: Default::default(),
             chromium_encoding: false,
+            safari_encoding: false,
             version_information: None,
             custom: Vec::new(),
         }
@@ -421,6 +428,9 @@ impl TransportParams {
         // write them as Chromium's QUIC does (see `chromium_encoding`).
         let mut params: Vec<(u64, Vec<u8>)> = Vec::new();
         let chromium = tp.chromium_encoding && !is_server;
+        let safari = tp.safari_encoding && !is_server;
+        // Both leave out an integer parameter at its default.
+        let omit_defaults = chromium || safari;
 
         let varint = |v: u64| -> Result<Vec<u8>> {
             assert!(v <= octets::MAX_VAR_INT);
@@ -450,7 +460,7 @@ impl TransportParams {
         // Chromium leaves out an integer parameter holding its default
         // value (IntegerParameter::Write).
         if tp.max_udp_payload_size != 0 &&
-            !(chromium && tp.max_udp_payload_size == 65527)
+            !(omit_defaults && tp.max_udp_payload_size == 65527)
         {
             params.push((0x0003, varint(tp.max_udp_payload_size)?));
         }
@@ -480,13 +490,13 @@ impl TransportParams {
             params.push((0x0009, varint(tp.initial_max_streams_uni)?));
         }
 
-        if tp.ack_delay_exponent != 0 && !(chromium && tp.ack_delay_exponent == 3)
+        if tp.ack_delay_exponent != 0 && !(omit_defaults && tp.ack_delay_exponent == 3)
         {
             assert!(tp.ack_delay_exponent <= MAX_ACK_DELAY_EXPONENT);
             params.push((0x000a, varint(tp.ack_delay_exponent)?));
         }
 
-        if tp.max_ack_delay != 0 && !(chromium && tp.max_ack_delay == 25) {
+        if tp.max_ack_delay != 0 && !(omit_defaults && tp.max_ack_delay == 25) {
             params.push((0x000b, varint(tp.max_ack_delay)?));
         }
 
@@ -549,6 +559,13 @@ impl TransportParams {
                 let j = (crate::rand::rand_u64() % (i as u64 + 1)) as usize;
                 params.swap(i, j);
             }
+        }
+
+        if safari && !params.is_empty() {
+            // In ascending order, starting at a random one.
+            params.sort_by_key(|p| p.0);
+            let at = (crate::rand::rand_u64() % params.len() as u64) as usize;
+            params.rotate_left(at);
         }
 
         let mut b = octets::OctetsMut::with_slice(out);

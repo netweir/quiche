@@ -447,6 +447,10 @@ pub const MAX_CONN_ID_LEN: usize = packet::MAX_CID_LEN as usize;
 /// The minimum length of Initial packets sent by a client.
 pub const MIN_CLIENT_INITIAL_LEN: usize = 1200;
 
+/// netweir: the most ClientHello bytes Safari 27 puts in one Initial
+/// packet, as recorded.
+const SAFARI_INITIAL_CRYPTO_MAX: usize = 999;
+
 /// The default initial RTT.
 const DEFAULT_INITIAL_RTT: Duration = Duration::from_millis(333);
 
@@ -625,6 +629,8 @@ pub struct Config {
     max_outstanding_sent_packets: Option<NonZeroUsize>,
 
     chromium_initial: bool,
+
+    safari_initial: bool,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -710,6 +716,8 @@ impl Config {
             ),
 
             chromium_initial: false,
+
+            safari_initial: false,
         })
     }
 
@@ -978,6 +986,29 @@ impl Config {
     /// The default value is `false`.
     pub fn enable_chromium_initial(&mut self, v: bool) {
         self.chromium_initial = v;
+    }
+
+    /// netweir: lays out a client's Initial packets as Safari 27's QUIC
+    /// (Apple's Network.framework) was recorded laying them out: each
+    /// packet carrying at most 999 bytes of the ClientHello, in one CRYPTO
+    /// frame, and filled to the end of its 1200-byte datagram with PADDING
+    /// frames rather than with zero bytes after the packet. Packet numbers
+    /// start at 0, as quiche's do. Clients only.
+    ///
+    /// The default value is `false`.
+    pub fn enable_safari_initial(&mut self, v: bool) {
+        self.safari_initial = v;
+    }
+
+    /// netweir: writes the transport parameters as Safari 27's QUIC was
+    /// recorded writing them: in ascending order of id, starting from a
+    /// random one and wrapping round, with no GREASE parameter, and
+    /// integer parameters that hold their default value left out. Clients
+    /// only.
+    ///
+    /// The default value is `false`.
+    pub fn enable_safari_transport_params(&mut self, v: bool) {
+        self.local_transport_params.safari_encoding = v;
     }
 
     /// netweir: writes the transport parameters as Chromium's QUIC does
@@ -1711,6 +1742,9 @@ where
 
     /// netweir: see `Config::enable_chromium_initial`.
     chromium_initial: bool,
+
+    /// netweir: see `Config::enable_safari_initial`.
+    safari_initial: bool,
 }
 
 /// Creates a new server-side connection.
@@ -2340,6 +2374,8 @@ impl<F: BufFactory> Connection<F> {
             max_outstanding_sent_packets: config.max_outstanding_sent_packets,
 
             chromium_initial: config.chromium_initial && !is_server,
+
+            safari_initial: config.safari_initial && !is_server,
         };
         if let Some(retry_cids) = retry_cids {
             conn.local_transport_params
@@ -5296,7 +5332,13 @@ impl<F: BufFactory> Connection<F> {
                 octets::varint_len(crypto_off) + // offset
                 2; // length, always encode as 2-byte varint
 
-            if let Some(max_len) = left.checked_sub(hdr_len) {
+            if let Some(mut max_len) = left.checked_sub(hdr_len) {
+                // netweir: Safari's Initial packets carry at most 999
+                // bytes of the hello each.
+                if self.safari_initial && pkt_type == Type::Initial {
+                    max_len = cmp::min(max_len, SAFARI_INITIAL_CRYPTO_MAX);
+                }
+
                 let (mut crypto_hdr, mut crypto_payload) =
                     b.split_at(hdr_off + hdr_len)?;
 
@@ -5613,8 +5655,10 @@ impl<F: BufFactory> Connection<F> {
         // as Initial always requires padding.
         //
         // 2) this is a probing packet towards an unvalidated peer address.
-        if (has_initial || !path.validated()) &&
-            pkt_type == Type::Short &&
+        //
+        // netweir: Safari fills its Initial packets with PADDING frames.
+        if ((has_initial || !path.validated()) && pkt_type == Type::Short ||
+            self.safari_initial && pkt_type == Type::Initial) &&
             left >= 1
         {
             let frame = frame::Frame::Padding { len: left };
