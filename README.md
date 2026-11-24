@@ -48,6 +48,30 @@ plain AES-GCM, and the pruned workspace. Congestion control, pacing and
 loss recovery are quiche's own. The licence is unchanged: BSD-2-Clause, in
 [COPYING](COPYING).
 
+### Fixes since the review
+
+A security review of the branch found these, and each fix is its own
+commit with a test that failed before it:
+
+- A lost first Initial packet left the handshake stuck: the resend joined
+  two runs of the ClientHello and sent the second at the wrong offset
+  (b5224f6e). A resent hello was also split again as if it were new, which
+  could overflow the packet's room (caf003ab).
+- An encoder instruction declaring a string longer than the table could
+  hold was buffered without limit (4c6c164a), and an integer too large for
+  64 bits stalled the encoder stream rather than failing it (bf3f10dc).
+- A body could be reported before its blocked headers (c5eae36a), and a
+  stream could report Finished before them (4f1f9345).
+- A blocked stream that was reset, or that the application stopped
+  reading, stayed blocked and later reported headers for a dead stream. It
+  now reports the reset and sends a QPACK Stream Cancellation, as Chrome
+  does (8c2f685e).
+- Debug builds now assert that no packet number is sealed twice with the
+  same key, the check plain AES-GCM doesn't make (7bf529a8).
+
+The `qpack_dynamic` and `h3_client_qpack` fuzz targets in `fuzz/` cover
+the dynamic table and the client's event order.
+
 Who uses quiche?
 ----------------
 
