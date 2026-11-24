@@ -357,6 +357,28 @@ impl<F: BufFactory> SendBuf<F> {
         Ok((out.len() - out_len, fin))
     }
 
+    /// netweir: the length of the run of data from `off_front()` with no
+    /// gap in it, as much as one call to [`Self::emit`] can return.
+    pub fn contiguous_len(&self) -> usize {
+        let start = self.off_front();
+        let end = cmp::min(self.off, self.max_data);
+        let mut next_off = start;
+
+        for buf in self.data.iter().skip(self.pos) {
+            if buf.is_empty() {
+                continue;
+            }
+
+            if buf.off() != next_off || next_off >= end {
+                break;
+            }
+
+            next_off = cmp::min(buf.max_off(), end);
+        }
+
+        (next_off - start) as usize
+    }
+
     /// Updates the max_data limit to the given value.
     pub fn update_max_data(&mut self, max_data: u64) {
         self.max_data = cmp::max(self.max_data, max_data);

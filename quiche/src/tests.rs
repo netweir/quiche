@@ -14733,3 +14733,60 @@ fn chromium_initial_flight() {
     }
     assert_eq!(layouts.len(), 20);
 }
+
+// netweir: a Chromium-style first flight still completes the handshake
+// when any one of its packets is lost.
+#[test]
+fn chromium_initial_flight_packet_lost() {
+    // A ClientHello of two packets, and one of four with twelve 200-byte
+    // ALPN entries.
+    let protos: Vec<Vec<u8>> =
+        (0..12).map(|i| vec![b'a' + i as u8; 200]).collect();
+    let mut big: Vec<&[u8]> = protos.iter().map(|p| &p[..]).collect();
+    big.push(b"proto1");
+
+    for (alpn, n) in [(None, 2), (Some(&big), 4)] {
+        for lost in 0..n {
+            let mut config =
+                test_utils::Pipe::default_config("cubic").unwrap();
+            config.enable_chromium_initial(true);
+            config.set_max_send_udp_payload_size(1250);
+            if let Some(alpn) = alpn {
+                config.set_application_protos(alpn).unwrap();
+            }
+
+            let mut pipe =
+                test_utils::Pipe::with_client_config(&mut config).unwrap();
+            let mut flight =
+                test_utils::emit_flight(&mut pipe.client).unwrap();
+            assert_eq!(flight.len(), n);
+            flight.remove(lost);
+            test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+            for _ in 0..8 {
+                if let Ok(f) = test_utils::emit_flight(&mut pipe.server) {
+                    test_utils::process_flight(&mut pipe.client, f)
+                        .unwrap();
+                }
+                if pipe.client.is_established() {
+                    break;
+                }
+                if let Some(t) = pipe.client.timeout() {
+                    std::thread::sleep(t + Duration::from_millis(1));
+                    pipe.client.on_timeout();
+                }
+                if let Ok(f) = test_utils::emit_flight(&mut pipe.client) {
+                    test_utils::process_flight(&mut pipe.server, f)
+                        .unwrap();
+                }
+            }
+
+            assert!(
+                pipe.client.is_established(),
+                "packet {lost} of {n} lost"
+            );
+            assert_eq!(pipe.client.local_error(), None);
+            assert_eq!(pipe.server.local_error(), None);
+        }
+    }
+}

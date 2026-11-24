@@ -5195,7 +5195,9 @@ impl<F: BufFactory> Connection<F> {
         {
             let send = &mut crypto_ctx.crypto_stream.send;
             let off = send.off_front();
-            let pending = (send.off_back() - off) as usize;
+            // What one emit returns: after a loss the data to resend can
+            // have gaps, and each run needs a frame at its own offset.
+            let pending = send.contiguous_len();
 
             let split = if off == 0 {
                 chaos::split_first_flight(left, pending)
@@ -5215,14 +5217,7 @@ impl<F: BufFactory> Connection<F> {
             };
 
             let mut data = vec![0; data_len];
-            let mut got = 0;
-            while got < data_len {
-                let (n, _) = send.emit(&mut data[got..])?;
-                if n == 0 {
-                    break;
-                }
-                got += n;
-            }
+            let (got, _) = send.emit(&mut data)?;
             data.truncate(got);
 
             let ranges = match split {
