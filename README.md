@@ -17,6 +17,37 @@ you can read a [post] on Cloudflare's blog that goes into some more detail.
 [ietf]: https://quicwg.org/
 [post]: https://blog.cloudflare.com/enjoy-a-slice-of-quic-and-rust/
 
+## This fork
+
+This is [Netweir](https://github.com/netweir/netweir)'s fork of Cloudflare's
+quiche, on the `chrome-157` branch. Netweir uses it to send requests over
+HTTP/3 that look, on the wire, like Chrome 157's. Each change is its own
+commit, and each says where in Google's QUICHE (Chrome's QUIC stack) the
+behaviour comes from:
+
+- quiche links [btls](https://github.com/0x676e67/btls), the patched
+  BoringSSL Netweir's TCP connections use, under the `boring` crate's
+  names. Both declare `links = "boringssl"`, so only one can be in a build.
+  The workspace keeps only `quiche`, `octets` and `qlog`.
+- `Config::enable_chromium_transport_params`, `set_version_information`
+  and `add_custom_transport_param`: transport parameters in a new random
+  order on each connection, with a GREASE parameter and a GREASE version.
+- `Config::enable_chromium_initial`: a client's Initial packets laid out
+  by a port of QUICHE's chaos protection (`src/chaos.rs`, which keeps the
+  Chromium Authors' BSD notice), filled with PADDING frames, numbered from
+  1. Packet protection uses plain AES-GCM, as QUICHE does.
+- `Connection::ssl_mut`: the BoringSSL handle, for settings it takes only
+  per connection.
+- `h3::Config::enable_chromium`: SETTINGS order and GREASE, no streams
+  opened before they're needed, Chrome's PRIORITY_UPDATE values.
+- QPACK: the decoder fills and uses the dynamic table, and acknowledges it.
+- No libc cap, which clashed with Netweir's lockfile.
+
+None of it changes quiche unless it's turned on, except the QPACK decoder,
+plain AES-GCM, and the pruned workspace. Congestion control, pacing and
+loss recovery are quiche's own. The licence is unchanged: BSD-2-Clause, in
+[COPYING](COPYING).
+
 Who uses quiche?
 ----------------
 
