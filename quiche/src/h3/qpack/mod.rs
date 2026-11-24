@@ -59,6 +59,14 @@ pub enum Error {
 
     /// The decoded header list exceeded the size limit.
     HeaderListTooLarge,
+
+    /// netweir: the field section refers to dynamic table entries that
+    /// haven't arrived on the encoder stream yet (RFC 9204, Section 2.1.2).
+    Blocked,
+
+    /// netweir: an encoder instruction couldn't be applied (RFC 9204,
+    /// Section 4.3): QPACK_ENCODER_STREAM_ERROR.
+    EncoderStream,
 }
 
 impl std::fmt::Display for Error {
@@ -240,13 +248,7 @@ pub use decoder::Decoder;
 pub use encoder::Encoder;
 
 mod decoder;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "not used until the decoder processes encoder instructions"
-    )
-)]
+#[cfg_attr(not(test), allow(dead_code))]
 mod dynamic_table;
 mod encoder;
 mod static_table;

@@ -404,6 +404,10 @@ pub enum Error {
     /// QPACK Header block decompression failure.
     QpackDecompressionFailed,
 
+    /// netweir: an instruction on the peer's QPACK encoder stream couldn't
+    /// be applied.
+    QpackEncoderStreamError,
+
     /// Error originated from the transport layer.
     TransportError(crate::Error),
 
@@ -512,6 +516,7 @@ impl Error {
             Error::IdError => WireErrorCode::IdError as u64,
             Error::MissingSettings => WireErrorCode::MissingSettings as u64,
             Error::QpackDecompressionFailed => 0x200,
+            Error::QpackEncoderStreamError => 0x201,
             Error::BufferTooShort => 0x999,
             Error::TransportError { .. } | Error::StreamBlocked => 0xFF,
             Error::SettingsError => WireErrorCode::SettingsError as u64,
@@ -547,6 +552,7 @@ impl Error {
             Error::MessageError => -18,
             Error::ConnectError => -19,
             Error::VersionFallback => -20,
+            Error::QpackEncoderStreamError => -21,
 
             Error::TransportError(quic_error) => quic_error.to_c() - 1000,
         }
@@ -1063,6 +1069,17 @@ pub struct Connection {
 
     /// netweir: see `Config::enable_chromium`.
     chromium: bool,
+
+    /// netweir: request streams whose field section waits for dynamic
+    /// table entries, with the section and its frame's length.
+    blocked: hash_map::HashMap<u64, (Vec<u8>, u64)>,
+
+    /// netweir: field sections decoded once their entries arrived, for
+    /// `poll()` to return.
+    unblocked: VecDeque<(u64, Event)>,
+
+    /// netweir: decoder instructions the decoder stream couldn't take yet.
+    decoder_out: Vec<u8>,
 }
 
 impl Connection {
@@ -1105,7 +1122,9 @@ impl Connection {
             peer_control_stream_id: None,
 
             qpack_encoder: qpack::Encoder::new(),
-            qpack_decoder: qpack::Decoder::new(),
+            qpack_decoder: qpack::Decoder::with_max_table_capacity(
+                config.qpack_max_table_capacity.unwrap_or(0),
+            ),
 
             local_qpack_streams: Default::default(),
             peer_qpack_streams: Default::default(),
@@ -1122,6 +1141,12 @@ impl Connection {
             max_priority_update_size: config.max_priority_update_size,
 
             chromium: config.chromium && !is_server,
+
+            blocked: hash_map::HashMap::new(),
+
+            unblocked: VecDeque::new(),
+
+            decoder_out: Vec::new(),
         })
     }
 
@@ -2209,6 +2234,11 @@ impl Connection {
             };
         }
 
+        // netweir: field sections that waited for dynamic table entries.
+        if let Some(ev) = self.unblocked.pop_front() {
+            return Ok(ev);
+        }
+
         // Process finished streams list.
         if let Some(ev) = self.pop_finished_stream(conn) {
             return Ok(ev);
@@ -2634,6 +2664,88 @@ impl Connection {
         Ok(())
     }
 
+    /// netweir: decodes the field sections whose dynamic table entries
+    /// have arrived, for `poll()` to return.
+    fn unblock<F: BufFactory>(
+        &mut self, conn: &mut super::Connection<F>,
+    ) -> Result<()> {
+        let max_size = self
+            .local_settings
+            .max_field_section_size
+            .unwrap_or(u64::MAX);
+
+        let mut ready: Vec<u64> = self
+            .blocked
+            .iter()
+            .filter(|(_, (block, _))| {
+                !self.qpack_decoder.is_blocked(block).unwrap_or(false)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        ready.sort_unstable();
+
+        for stream_id in ready {
+            let Some((block, _)) = self.blocked.remove(&stream_id) else {
+                continue;
+            };
+
+            let list =
+                match self.qpack_decoder.decode_for_stream(&block, max_size, stream_id)
+                {
+                    Ok(v) => v,
+
+                    Err(e) => {
+                        let e = match e {
+                            qpack::Error::HeaderListTooLarge =>
+                                Error::ExcessiveLoad,
+
+                            _ => Error::QpackDecompressionFailed,
+                        };
+
+                        conn.close(true, e.to_wire(), b"Error parsing headers.")?;
+
+                        return Err(e);
+                    },
+                };
+
+            let more_frames = !conn.stream_finished(stream_id);
+
+            self.unblocked
+                .push_back((stream_id, Event::Headers { list, more_frames }));
+        }
+
+        self.flush_qpack_decoder(conn);
+
+        Ok(())
+    }
+
+    /// netweir: sends the QPACK decoder's instructions, opening the
+    /// decoder stream first if it isn't open yet, as Chromium opens it
+    /// only once it has something to send (qpack_send_stream.cc,
+    /// MaybeSendStreamType).
+    fn flush_qpack_decoder<F: BufFactory>(
+        &mut self, conn: &mut super::Connection<F>,
+    ) {
+        self.decoder_out
+            .extend_from_slice(&self.qpack_decoder.take_instructions());
+
+        if self.decoder_out.is_empty() {
+            return;
+        }
+
+        if self.local_qpack_streams.decoder_stream_id.is_none() &&
+            self.open_qpack_decoder_stream(conn).is_err()
+        {
+            return;
+        }
+
+        if let Some(id) = self.local_qpack_streams.decoder_stream_id {
+            if let Ok(n) = conn.stream_send(id, &self.decoder_out, false) {
+                self.decoder_out.drain(..n);
+            }
+        }
+    }
+
     /// netweir: SETTINGS and a GREASE frame on the control stream, as
     /// Chromium sends them (see `Config::enable_chromium`).
     fn send_chromium_settings<F: BufFactory>(
@@ -2734,6 +2846,12 @@ impl Connection {
                 self.max_priority_update_size,
             )
         });
+
+        // netweir: a stream whose field section waits for dynamic table
+        // entries is read no further until they arrive.
+        if self.blocked.contains_key(&stream_id) {
+            return Err(Error::Done);
+        }
 
         // We need to get a fresh reference to the stream for each
         // iteration, to avoid borrowing `self` for the entire duration
@@ -3032,17 +3150,38 @@ impl Connection {
 
                 stream::State::QpackInstruction => {
                     let mut d = [0; 4096];
+                    let ty = stream.ty();
 
-                    // Read data from the stream and discard immediately.
-                    //
-                    // TODO: pass encoder stream data to the QPACK decoder.
+                    // netweir: encoder stream data goes to the QPACK
+                    // decoder; decoder stream data is read and dropped, as
+                    // the encoder never uses the peer's dynamic table.
                     loop {
-                        let (recv, fin) = conn.stream_recv(stream_id, &mut d)?;
+                        let (recv, fin) = match conn.stream_recv(stream_id, &mut d)
+                        {
+                            Ok(v) => v,
 
-                        match stream.ty() {
-                            Some(stream::Type::QpackEncoder) =>
+                            Err(e) => {
+                                self.unblock(conn)?;
+                                return Err(e.into());
+                            },
+                        };
+
+                        match ty {
+                            Some(stream::Type::QpackEncoder) => {
                                 self.peer_qpack_streams.encoder_stream_bytes +=
-                                    recv as u64,
+                                    recv as u64;
+
+                                if self.qpack_decoder.control(&mut d[..recv]).is_err()
+                                {
+                                    let e = Error::QpackEncoderStreamError;
+                                    conn.close(
+                                        true,
+                                        e.to_wire(),
+                                        b"Error in QPACK encoder instruction.",
+                                    )?;
+                                    return Err(e);
+                                }
+                            },
                             Some(stream::Type::QpackDecoder) =>
                                 self.peer_qpack_streams.decoder_stream_bytes +=
                                     recv as u64,
@@ -3157,7 +3296,13 @@ impl Connection {
     fn pop_finished_stream<F: BufFactory>(
         &mut self, conn: &mut super::Connection<F>,
     ) -> Option<(u64, Event)> {
-        let finished = self.finished_streams.pop_front()?;
+        // netweir: a stream waiting for dynamic table entries finishes
+        // after its headers.
+        let at = self
+            .finished_streams
+            .iter()
+            .position(|id| !self.blocked.contains_key(id))?;
+        let finished = self.finished_streams.remove(at)?;
 
         self.remove_local_finished_stream(finished);
 
@@ -3258,11 +3403,25 @@ impl Connection {
                     .max_field_section_size
                     .unwrap_or(u64::MAX);
 
-                let headers = match self
-                    .qpack_decoder
-                    .decode(&header_block[..], max_size)
-                {
+                let headers = match self.qpack_decoder.decode_for_stream(
+                    &header_block[..],
+                    max_size,
+                    stream_id,
+                ) {
                     Ok(v) => v,
+
+                    // netweir: it waits for its entries, up to the number
+                    // of blocked streams the peer was allowed.
+                    Err(qpack::Error::Blocked)
+                        if (self.blocked.len() as u64) <
+                            self.local_settings
+                                .qpack_blocked_streams
+                                .unwrap_or(0) =>
+                    {
+                        self.blocked
+                            .insert(stream_id, (header_block.to_vec(), payload_len));
+                        return Err(Error::Done);
+                    },
 
                     Err(e) => {
                         let e = match e {
@@ -3277,6 +3436,8 @@ impl Connection {
                         return Err(e);
                     },
                 };
+
+                self.flush_qpack_decoder(conn);
 
                 qlog_with_type!(QLOG_FRAME_PARSED, conn.qlog, q, {
                     let qlog_headers = headers
@@ -3940,6 +4101,63 @@ mod tests {
     use super::*;
 
     use super::testing::*;
+
+    // netweir: a response whose headers wait for the encoder stream.
+    #[test]
+    fn qpack_blocked_response_headers() {
+        let (mut config, mut h3_config) = Session::default_configs().unwrap();
+        h3_config.set_qpack_max_table_capacity(4096);
+        h3_config.set_qpack_blocked_streams(10);
+        h3_config.enable_chromium(true);
+        let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
+        s.handshake().unwrap();
+
+        let (stream, _) = s.send_request(true).unwrap();
+        loop {
+            match s.poll_server() {
+                Ok((_, Event::Headers { .. })) => break,
+                Ok(_) => continue,
+                Err(e) => panic!("{e:?}"),
+            }
+        }
+
+        // Required Insert Count 1, Base 1, Indexed dynamic 0, then :status
+        // 200 from the static table.
+        s.send_frame_server(
+            frame::Frame::Headers {
+                header_block: vec![0x02, 0x00, 0x80, 0xd9],
+            },
+            stream,
+            true,
+        )
+        .unwrap();
+        assert_eq!(s.poll_client(), Err(Error::Done));
+
+        let encoder = s.server.local_qpack_streams.encoder_stream_id.unwrap();
+        let mut instructions = vec![0x3f, 0xbd, 0x01, 0x4a];
+        instructions.extend_from_slice(b"custom-key");
+        instructions.push(0x0c);
+        instructions.extend_from_slice(b"custom-value");
+        s.pipe.server.stream_send(encoder, &instructions, false).unwrap();
+        s.advance().ok();
+
+        assert_eq!(
+            s.poll_client(),
+            Ok((stream, Event::Headers {
+                list: vec![
+                    Header::new(b"custom-key", b"custom-value"),
+                    Header::new(b":status", b"200"),
+                ],
+                more_frames: false,
+            }))
+        );
+        assert_eq!(s.poll_client(), Ok((stream, Event::Finished)));
+
+        // The decoder stream opened with the Section Acknowledgment.
+        s.advance().ok();
+        while s.poll_server().is_ok() {}
+        assert_eq!(s.server.peer_qpack_streams.decoder_stream_bytes, 1);
+    }
 
     // netweir: a client's control stream and PRIORITY_UPDATE as Chrome's.
     #[test]
@@ -5983,11 +6201,15 @@ mod tests {
     #[test]
     /// Client closes QPACK stream after sending some stuff, which is forbidden.
     fn close_qpack_stream_after_data() {
-        let mut s = Session::new().unwrap();
+        // netweir: the encoder may only send instructions to a decoder
+        // with a table; Set Dynamic Table Capacity 0 is one.
+        let (mut config, mut h3_config) = Session::default_configs().unwrap();
+        h3_config.set_qpack_max_table_capacity(4096);
+        let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
         s.handshake().unwrap();
 
         let stream_id = s.client.local_qpack_streams.encoder_stream_id.unwrap();
-        let d = [0; 1];
+        let d = [0x20; 1];
 
         s.pipe.client.stream_send(stream_id, &d, false).unwrap();
         s.pipe.client.stream_send(stream_id, &d, true).unwrap();
@@ -6028,11 +6250,15 @@ mod tests {
     #[test]
     /// Client resets QPACK stream after sending some stuff, which is forbidden.
     fn reset_qpack_stream_after_data() {
-        let mut s = Session::new().unwrap();
+        // netweir: the encoder may only send instructions to a decoder
+        // with a table; Set Dynamic Table Capacity 0 is one.
+        let (mut config, mut h3_config) = Session::default_configs().unwrap();
+        h3_config.set_qpack_max_table_capacity(4096);
+        let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
         s.handshake().unwrap();
 
         let stream_id = s.client.local_qpack_streams.encoder_stream_id.unwrap();
-        let d = [0; 1];
+        let d = [0x20; 1];
 
         s.pipe.client.stream_send(stream_id, &d, false).unwrap();
         s.pipe.client.stream_send(stream_id, &d, false).unwrap();
@@ -6058,14 +6284,16 @@ mod tests {
     #[test]
     /// Client sends QPACK data.
     fn qpack_data() {
-        // TODO: QPACK instructions are ignored until dynamic table support is
-        // added so we just test that the data is safely ignored.
-        let mut s = Session::new().unwrap();
+        // netweir: the encoder may only send instructions to a decoder
+        // with a table; Set Dynamic Table Capacity 0 is one.
+        let (mut config, mut h3_config) = Session::default_configs().unwrap();
+        h3_config.set_qpack_max_table_capacity(4096);
+        let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
         s.handshake().unwrap();
 
         let e_stream_id = s.client.local_qpack_streams.encoder_stream_id.unwrap();
         let d_stream_id = s.client.local_qpack_streams.decoder_stream_id.unwrap();
-        let d = [0; 20];
+        let d = [0x20; 20];
 
         s.pipe.client.stream_send(e_stream_id, &d, false).unwrap();
         s.advance().ok();

@@ -24,6 +24,8 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use super::dynamic_table::DynamicTable;
+use super::dynamic_table::TableError;
 use super::Error;
 use super::Result;
 
@@ -121,49 +123,265 @@ impl FieldListSizeTracker {
 }
 
 /// A QPACK decoder.
-#[derive(Default)]
+///
+/// netweir: with a dynamic table, filled from the peer's encoder stream,
+/// and the decoder instructions acknowledging it (RFC 9204, Sections 3.2,
+/// 4.3 and 4.4), sent as Chromium's QpackDecoder sends them
+/// (quiche/quic/core/qpack/qpack_decoder.cc, OnDecodingCompleted): a
+/// Section Acknowledgment for each field section that used the table,
+/// then an Insert Count Increment for any entries still unacknowledged.
 pub struct Decoder {
-    // TODO: hold a dynamic table whose maximum capacity is the
-    // SETTINGS_QPACK_MAX_TABLE_CAPACITY value advertised to the peer.
-    //
-    // TODO: queue decoder instructions (RFC 9204, Section 4.4) for the
-    // connection to send on the decoder stream.
+    table: DynamicTable,
+
+    /// Encoder stream bytes that don't make a whole instruction yet.
+    partial: Vec<u8>,
+
+    /// Decoder instructions waiting to go out on the decoder stream.
+    instructions: Vec<u8>,
+
+    /// The insert count the encoder knows the decoder has reached.
+    known_received_count: u64,
+}
+
+impl Default for Decoder {
+    fn default() -> Decoder {
+        Decoder::new()
+    }
 }
 
 impl Decoder {
-    /// Creates a new QPACK decoder.
+    /// Creates a new QPACK decoder, with no dynamic table.
     pub fn new() -> Decoder {
-        Decoder::default()
+        Decoder::with_max_table_capacity(0)
+    }
+
+    /// netweir: creates a QPACK decoder whose dynamic table may grow to
+    /// `max`, the SETTINGS_QPACK_MAX_TABLE_CAPACITY advertised to the peer.
+    pub fn with_max_table_capacity(max: u64) -> Decoder {
+        Decoder {
+            table: DynamicTable::new(usize::try_from(max).unwrap_or(usize::MAX)),
+            partial: Vec::new(),
+            instructions: Vec::new(),
+            known_received_count: 0,
+        }
+    }
+
+    /// netweir: the number of entries inserted in the dynamic table so far.
+    pub fn insert_count(&self) -> u64 {
+        self.table.insert_count()
+    }
+
+    /// netweir: takes the decoder instructions to send on the decoder
+    /// stream.
+    pub fn take_instructions(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.instructions)
     }
 
     /// Processes control instructions from the encoder.
-    pub fn control(&mut self, _buf: &mut [u8]) -> Result<()> {
-        // TODO: parse encoder instructions (RFC 9204, Section 4.3), including
-        // ones split across calls, and apply them to the dynamic table. Their
-        // errors are connection errors of type QPACK_ENCODER_STREAM_ERROR.
-        // TODO: if the advertised maximum table capacity is zero, reject
-        // all encoder instructions (even Set Dynamic Table Capacity 0) before
-        // dispatching them to the table (RFC 9204, Section 3.2.3).
+    ///
+    /// netweir: applies them to the dynamic table. An instruction split
+    /// across calls is kept until the rest arrives.
+    pub fn control(&mut self, buf: &mut [u8]) -> Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+
+        // With no table to fill, any encoder instruction is an error (RFC
+        // 9204, Section 3.2.3).
+        if self.table.max_capacity() == 0 {
+            return Err(Error::EncoderStream);
+        }
+
+        self.partial.extend_from_slice(buf);
+
+        let data = std::mem::take(&mut self.partial);
+        let mut b = octets::Octets::with_slice(&data);
+
+        while b.cap() > 0 {
+            let at = b.off();
+
+            match self.instruction(&mut b) {
+                Ok(()) => (),
+
+                Err(Error::BufferTooShort) => {
+                    self.partial = data[at..].to_vec();
+                    return Ok(());
+                },
+
+                Err(_) => return Err(Error::EncoderStream),
+            }
+        }
+
         Ok(())
+    }
+
+    /// Reads one encoder instruction and applies it.
+    fn instruction(&mut self, b: &mut octets::Octets) -> Result<()> {
+        let first = b.peek_u8()?;
+        let max = self.table.max_capacity();
+        let shared = |v: Vec<u8>| -> std::sync::Arc<[u8]> { v.into() };
+        let table = |r: std::result::Result<(), TableError>| {
+            r.map_err(|_| Error::EncoderStream)
+        };
+
+        if first & 0x80 == 0x80 {
+            // Insert with Name Reference.
+            let is_static = first & 0x40 == 0x40;
+            let index = decode_int(b, 6)?;
+            let value = shared(decode_str(b, max)?);
+
+            if is_static {
+                table(self.table.insert_with_static_name_reference(index, value))
+            } else {
+                table(self.table.insert_with_dynamic_name_reference(index, value))
+            }
+        } else if first & 0x40 == 0x40 {
+            // Insert with Literal Name.
+            let huff = first & 0x20 == 0x20;
+            let len = decode_int(b, 5)? as usize;
+            let mut name = b.get_bytes(len)?;
+            let name = if huff {
+                name.get_huffman_decoded_with_max_length(max)
+                    .map_err(|_| Error::EncoderStream)?
+            } else {
+                name.to_vec()
+            };
+            let value = shared(decode_str(b, max)?);
+
+            table(self.table.insert_with_literal_name(shared(name), value))
+        } else if first & 0x20 == 0x20 {
+            // Set Dynamic Table Capacity.
+            let capacity = decode_int(b, 5)?;
+
+            table(self.table.set_dynamic_table_capacity(capacity))
+        } else {
+            // Duplicate.
+            let index = decode_int(b, 5)?;
+
+            table(self.table.duplicate(index))
+        }
+    }
+
+    /// The Required Insert Count of a field section (RFC 9204, Section
+    /// 4.5.1.1), read from its prefix.
+    fn required_insert_count(&self, encoded: u64) -> Result<u64> {
+        if encoded == 0 {
+            return Ok(0);
+        }
+
+        let max_entries = self.table.max_capacity() as u64 / 32;
+        let full_range = 2 * max_entries;
+
+        if encoded > full_range {
+            return Err(Error::InvalidHeaderValue);
+        }
+
+        let max_value = self.table.insert_count() + max_entries;
+        let max_wrapped = (max_value / full_range) * full_range;
+        let mut ric = max_wrapped + encoded - 1;
+
+        if ric > max_value {
+            if ric <= full_range {
+                return Err(Error::InvalidHeaderValue);
+            }
+
+            ric -= full_range;
+        }
+
+        if ric == 0 {
+            return Err(Error::InvalidHeaderValue);
+        }
+
+        Ok(ric)
+    }
+
+    /// netweir: whether the field section in `buf` needs dynamic table
+    /// entries that haven't arrived yet.
+    pub fn is_blocked(&self, buf: &[u8]) -> Result<bool> {
+        let mut b = octets::Octets::with_slice(buf);
+        let ric = self.required_insert_count(decode_int(&mut b, 8)?)?;
+
+        Ok(ric > self.table.insert_count())
+    }
+
+    /// netweir: decodes the field section of `stream_id`, then queues the
+    /// decoder instructions Chromium sends after one.
+    pub fn decode_for_stream(
+        &mut self, buf: &[u8], max_size: u64, stream_id: u64,
+    ) -> Result<Vec<Header>> {
+        let (headers, ric) = self.decode_section(buf, max_size)?;
+
+        if ric > 0 {
+            // Section Acknowledgment.
+            encode_int_into(&mut self.instructions, stream_id, 0x80, 7);
+            self.known_received_count = self.known_received_count.max(ric);
+        }
+
+        let inserts = self.table.insert_count();
+        if self.known_received_count < inserts {
+            // Insert Count Increment.
+            encode_int_into(
+                &mut self.instructions,
+                inserts - self.known_received_count,
+                0x00,
+                6,
+            );
+            self.known_received_count = inserts;
+        }
+
+        Ok(headers)
     }
 
     /// Decodes a QPACK header block into a list of headers.
     pub fn decode(&mut self, buf: &[u8], max_size: u64) -> Result<Vec<Header>> {
+        self.decode_section(buf, max_size).map(|(headers, _)| headers)
+    }
+
+    /// The headers of a field section, and its Required Insert Count.
+    fn decode_section(
+        &mut self, buf: &[u8], max_size: u64,
+    ) -> Result<(Vec<Header>, u64)> {
         let mut b = octets::Octets::with_slice(buf);
 
         let mut out = Vec::new();
 
         let mut size_tracker = FieldListSizeTracker::new(max_size);
 
-        let req_insert_count = decode_int(&mut b, 8)?;
-        let base = decode_int(&mut b, 7)?;
+        let req_insert_count = self.required_insert_count(decode_int(&mut b, 8)?)?;
 
-        // TODO: decode the Required Insert Count and Base (RFC 9204, Section
-        // 4.5.1). With SETTINGS_QPACK_BLOCKED_STREAMS set to 0, a Required
-        // Insert Count above the dynamic table's insert count is a connection
-        // error of type QPACK_DECOMPRESSION_FAILED (RFC 9204, Section 2.1.2).
+        if req_insert_count > self.table.insert_count() {
+            return Err(Error::Blocked);
+        }
+
+        // Base (RFC 9204, Section 4.5.1.2).
+        let sign = b.peek_u8()? & 0x80 == 0x80;
+        let delta_base = decode_int(&mut b, 7)?;
+        let base = if sign {
+            req_insert_count
+                .checked_sub(delta_base)
+                .and_then(|v| v.checked_sub(1))
+                .ok_or(Error::InvalidHeaderValue)?
+        } else {
+            req_insert_count
+                .checked_add(delta_base)
+                .ok_or(Error::InvalidHeaderValue)?
+        };
 
         trace!("Header count={req_insert_count} base={base}");
+
+        // An entry of the dynamic table this section may refer to: at or
+        // above neither the Required Insert Count nor what the table holds.
+        let dynamic = |absolute: Option<u64>| -> Result<(Vec<u8>, Vec<u8>)> {
+            let absolute = absolute.ok_or(Error::InvalidHeaderValue)?;
+            if absolute >= req_insert_count {
+                return Err(Error::InvalidHeaderValue);
+            }
+            let entry = self
+                .table
+                .get_by_absolute_index(absolute)
+                .ok_or(Error::InvalidHeaderValue)?;
+            Ok((entry.name().to_vec(), entry.value().to_vec()))
+        };
 
         while b.cap() > 0 {
             let first = b.peek_u8()?;
@@ -179,19 +397,18 @@ impl Decoder {
 
                     trace!("Indexed index={index} static={s}");
 
-                    if !s {
-                        // TODO: implement dynamic table
-                        return Err(Error::InvalidHeaderValue);
-                    }
-
-                    let (name, value) = lookup_static(index)?;
+                    let (name, value) = if s {
+                        let (name, value) = lookup_static(index)?;
+                        (name.to_vec(), value.to_vec())
+                    } else {
+                        dynamic(base.checked_sub(index).and_then(|v| v.checked_sub(1)))?
+                    };
 
                     size_tracker.on_field_part_decoded(
                         (name.len() + value.len()) as u64,
                     )?;
 
-                    let hdr = Header::new(name, value);
-                    out.push(hdr);
+                    out.push(Header(name, value));
                 },
 
                 Representation::IndexedWithPostBase => {
@@ -199,8 +416,13 @@ impl Decoder {
 
                     trace!("Indexed With Post Base index={index}");
 
-                    // TODO: implement dynamic table
-                    return Err(Error::InvalidHeaderValue);
+                    let (name, value) = dynamic(base.checked_add(index))?;
+
+                    size_tracker.on_field_part_decoded(
+                        (name.len() + value.len()) as u64,
+                    )?;
+
+                    out.push(Header(name, value));
                 },
 
                 Representation::Literal => {
@@ -242,14 +464,16 @@ impl Decoder {
 
                     let s = first & STATIC == STATIC;
 
-                    if !s {
-                        // TODO: implement dynamic table
-                        return Err(Error::InvalidHeaderValue);
-                    }
-
                     let name_idx = decode_int(&mut b, 4)?;
 
-                    let (name, _) = lookup_static(name_idx)?;
+                    let name = if s {
+                        lookup_static(name_idx)?.0.to_vec()
+                    } else {
+                        dynamic(
+                            base.checked_sub(name_idx).and_then(|v| v.checked_sub(1)),
+                        )?
+                        .0
+                    };
 
                     size_tracker.on_field_part_decoded(name.len() as u64)?;
 
@@ -261,23 +485,50 @@ impl Decoder {
 
                     size_tracker.on_field_part_decoded(value.len() as u64)?;
 
-                    // Instead of calling Header::new(), create Header directly
-                    // from `value`, but clone `name` as it is just a reference.
-                    let hdr = Header(name.to_vec(), value);
-                    out.push(hdr);
+                    out.push(Header(name, value));
                 },
 
                 Representation::LiteralWithPostBase => {
                     trace!("Literal With Post Base");
 
-                    // TODO: implement dynamic table
-                    return Err(Error::InvalidHeaderValue);
+                    let name_idx = decode_int(&mut b, 3)?;
+
+                    let name = dynamic(base.checked_add(name_idx))?.0;
+
+                    size_tracker.on_field_part_decoded(name.len() as u64)?;
+
+                    let value = decode_str(&mut b, size_tracker.left() as usize)?;
+
+                    size_tracker.on_field_part_decoded(value.len() as u64)?;
+
+                    out.push(Header(name, value));
                 },
             }
         }
 
-        Ok(out)
+        Ok((out, req_insert_count))
     }
+}
+
+/// Appends `v` to `out` as a QPACK prefixed integer (RFC 9204, Section
+/// 4.1.1), with `first` holding the bits above the prefix.
+fn encode_int_into(out: &mut Vec<u8>, mut v: u64, first: u8, prefix: usize) {
+    let mask = (1u64 << prefix) - 1;
+
+    if v < mask {
+        out.push(first | v as u8);
+        return;
+    }
+
+    out.push(first | mask as u8);
+    v -= mask;
+
+    while v >= 128 {
+        out.push((v % 128) as u8 | 0x80);
+        v /= 128;
+    }
+
+    out.push(v as u8);
 }
 
 fn lookup_static(idx: u64) -> Result<(&'static [u8], &'static [u8])> {
@@ -344,6 +595,84 @@ fn decode_str(b: &mut octets::Octets, max_len: usize) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // netweir: the dynamic table, filled from the encoder stream.
+    fn custom_entry_decoder() -> Decoder {
+        let mut d = Decoder::with_max_table_capacity(4096);
+        // Set Dynamic Table Capacity 220, then Insert with Literal Name
+        // custom-key: custom-value, split across two calls.
+        let mut instructions = vec![0x3f, 0xbd, 0x01, 0x4a];
+        instructions.extend_from_slice(b"custom-key");
+        instructions.push(0x0c);
+        instructions.extend_from_slice(b"custom-value");
+        let (one, two) = instructions.split_at_mut(9);
+        d.control(one).unwrap();
+        assert_eq!(d.insert_count(), 0);
+        d.control(two).unwrap();
+        assert_eq!(d.insert_count(), 1);
+        d
+    }
+
+    #[test]
+    fn dynamic_indexed_and_acknowledged() {
+        let mut d = custom_entry_decoder();
+        // Required Insert Count 1 (encoded 2 for 128 entries), Base 1,
+        // Indexed dynamic relative 0, then a static :method GET.
+        let block = [0x02, 0x00, 0x80, 0xd1];
+        let headers = d.decode_for_stream(&block, u64::MAX, 4).unwrap();
+        assert_eq!(headers, vec![
+            Header::new(b"custom-key", b"custom-value"),
+            Header::new(b":method", b"GET"),
+        ]);
+        // Section Acknowledgment for stream 4, and nothing else to count.
+        assert_eq!(d.take_instructions(), vec![0x84]);
+    }
+
+    #[test]
+    fn dynamic_post_base_and_name_reference() {
+        let mut d = custom_entry_decoder();
+        // Required Insert Count 1, Base 0 (sign set, delta 0): Indexed
+        // With Post-Base 0, then Literal With Post-Base Name Reference 0.
+        let block = [0x02, 0x80, 0x10, 0x00, 0x03, b'a', b'b', b'c'];
+        let headers = d.decode_for_stream(&block, u64::MAX, 0).unwrap();
+        assert_eq!(headers, vec![
+            Header::new(b"custom-key", b"custom-value"),
+            Header::new(b"custom-key", b"abc"),
+        ]);
+    }
+
+    #[test]
+    fn entries_not_referenced_are_counted() {
+        let mut d = custom_entry_decoder();
+        let headers = d.decode_for_stream(&[0x00, 0x00, 0xd1], u64::MAX, 0).unwrap();
+        assert_eq!(headers, vec![Header::new(b":method", b"GET")]);
+        // Insert Count Increment 1.
+        assert_eq!(d.take_instructions(), vec![0x01]);
+    }
+
+    #[test]
+    fn section_waits_for_its_entries() {
+        let mut d = Decoder::with_max_table_capacity(4096);
+        let block = [0x02, 0x00, 0x80];
+        assert_eq!(d.is_blocked(&block), Ok(true));
+        assert_eq!(d.decode_for_stream(&block, u64::MAX, 0), Err(Error::Blocked));
+        let mut d = custom_entry_decoder();
+        assert_eq!(d.is_blocked(&block), Ok(false));
+        // A reference past the Required Insert Count is an error.
+        assert_eq!(
+            d.decode_for_stream(&[0x02, 0x00, 0x81], u64::MAX, 0),
+            Err(Error::InvalidHeaderValue)
+        );
+    }
+
+    #[test]
+    fn instructions_without_a_table_are_errors() {
+        let mut d = Decoder::new();
+        assert_eq!(d.control(&mut [0x20]), Err(Error::EncoderStream));
+        let mut d = Decoder::with_max_table_capacity(100);
+        // Capacity above the advertised maximum.
+        assert_eq!(d.control(&mut [0x3f, 0xbd, 0x01]), Err(Error::EncoderStream));
+    }
 
     #[test]
     fn decode_int1() {

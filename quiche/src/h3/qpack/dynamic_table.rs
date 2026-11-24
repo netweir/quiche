@@ -28,8 +28,6 @@
 //!
 //! See <https://www.rfc-editor.org/rfc/rfc9204.html#section-3.2>.
 
-// TODO: the decoder doesn't use this table yet; see the TODOs in decoder.rs.
-
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -157,7 +155,7 @@ impl DynamicTable {
     }
 
     /// Returns the maximum capacity the encoder may set.
-    fn max_capacity(&self) -> usize {
+    pub(crate) fn max_capacity(&self) -> usize {
         self.max_capacity
     }
 
@@ -169,7 +167,7 @@ impl DynamicTable {
     /// Returns the number of entries ever inserted, including duplicates.
     ///
     /// Evictions and capacity changes don't decrease it.
-    fn insert_count(&self) -> u64 {
+    pub(crate) fn insert_count(&self) -> u64 {
         self.insert_count
     }
 
@@ -187,7 +185,7 @@ impl DynamicTable {
 
     /// Sets the table's capacity, evicting the oldest entries that no longer
     /// fit (RFC 9204, Section 4.3.1).
-    fn set_dynamic_table_capacity(
+    pub(crate) fn set_dynamic_table_capacity(
         &mut self, capacity: u64,
     ) -> Result<(), TableError> {
         let capacity = usize::try_from(capacity)
@@ -207,7 +205,7 @@ impl DynamicTable {
     /// (RFC 9204, Section 4.3.2).
     ///
     /// The name is borrowed from the static table, not copied.
-    fn insert_with_static_name_reference(
+    pub(crate) fn insert_with_static_name_reference(
         &mut self, static_index: u64, value: Arc<[u8]>,
     ) -> Result<(), TableError> {
         let index = usize::try_from(static_index)
@@ -223,7 +221,7 @@ impl DynamicTable {
     /// `encoder_relative_index` (RFC 9204, Section 4.3.2).
     ///
     /// The name is shared with the referenced entry, not copied.
-    fn insert_with_dynamic_name_reference(
+    pub(crate) fn insert_with_dynamic_name_reference(
         &mut self, encoder_relative_index: u64, value: Arc<[u8]>,
     ) -> Result<(), TableError> {
         // Take a handle to the name first, as inserting may evict the
@@ -238,7 +236,7 @@ impl DynamicTable {
     }
 
     /// Inserts an entry with a literal name (RFC 9204, Section 4.3.3).
-    fn insert_with_literal_name(
+    pub(crate) fn insert_with_literal_name(
         &mut self, name: Arc<[u8]>, value: Arc<[u8]>,
     ) -> Result<(), TableError> {
         self.insert(Entry::new(EntryName::Shared(name), value)?)
@@ -248,7 +246,7 @@ impl DynamicTable {
     /// 9204, Section 4.3.4).
     ///
     /// The new entry shares its name and value with the existing one.
-    fn duplicate(
+    pub(crate) fn duplicate(
         &mut self, encoder_relative_index: u64,
     ) -> Result<(), TableError> {
         // Take handles to the entry's name and value first, as inserting may
