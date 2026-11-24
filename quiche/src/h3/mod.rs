@@ -7813,6 +7813,36 @@ mod tests {
     }
 
     #[test]
+    /// Tests that a client rejects a DATA frame that arrives on a request
+    /// stream before any HEADERS.
+    fn data_before_headers_on_request_stream_client() {
+        let mut s = Session::new().unwrap();
+        s.handshake().unwrap();
+
+        let (stream, _req) = s.send_request(true).unwrap();
+
+        let data = frame::Frame::Data {
+            payload: vec![7; 10],
+        };
+        s.send_frame_server(data, stream, false).unwrap();
+
+        // The client MUST treat this as H3_FRAME_UNEXPECTED, not as Data.
+        assert_eq!(s.poll_client(), Err(Error::FrameUnexpected));
+        assert_eq!(
+            s.pipe.client.local_error(),
+            Some(&crate::ConnectionError {
+                is_app: true,
+                error_code: WireErrorCode::FrameUnexpected as u64,
+                reason: format!(
+                    "Unexpected frame type {}",
+                    frame::DATA_FRAME_TYPE_ID
+                )
+                .into_bytes(),
+            })
+        );
+    }
+
+    #[test]
     /// Tests that a client rejects a SETTINGS frame received on a request
     /// stream.
     fn settings_on_request_stream_client() {
