@@ -192,25 +192,32 @@ impl Decoder {
             return Err(Error::EncoderStream);
         }
 
-        self.partial.extend_from_slice(buf);
+        let mut data = std::mem::take(&mut self.partial);
+        data.extend_from_slice(buf);
 
-        let data = std::mem::take(&mut self.partial);
         let mut b = octets::Octets::with_slice(&data);
 
-        while b.cap() > 0 {
+        let consumed = loop {
             let at = b.off();
+
+            if b.cap() == 0 {
+                break at;
+            }
 
             match self.instruction(&mut b) {
                 Ok(()) => (),
 
-                Err(Error::BufferTooShort) => {
-                    self.partial = data[at..].to_vec();
-                    return Ok(());
-                },
+                Err(Error::BufferTooShort) => break at,
 
                 Err(_) => return Err(Error::EncoderStream),
             }
-        }
+        };
+
+        // Keep the unfinished instruction in place rather than copying it
+        // out, so a long one arriving in small pieces isn't copied again
+        // with each piece.
+        data.drain(..consumed);
+        self.partial = data;
 
         Ok(())
     }
@@ -228,7 +235,7 @@ impl Decoder {
             // Insert with Name Reference.
             let is_static = first & 0x40 == 0x40;
             let index = decode_int(b, 6)?;
-            let value = shared(decode_str(b, max)?);
+            let value = shared(encoder_str(b, 7, max)?);
 
             if is_static {
                 table(self.table.insert_with_static_name_reference(index, value))
@@ -237,18 +244,10 @@ impl Decoder {
             }
         } else if first & 0x40 == 0x40 {
             // Insert with Literal Name.
-            let huff = first & 0x20 == 0x20;
-            let len = decode_int(b, 5)? as usize;
-            let mut name = b.get_bytes(len)?;
-            let name = if huff {
-                name.get_huffman_decoded_with_max_length(max)
-                    .map_err(|_| Error::EncoderStream)?
-            } else {
-                name.to_vec()
-            };
-            let value = shared(decode_str(b, max)?);
+            let name = shared(encoder_str(b, 5, max)?);
+            let value = shared(encoder_str(b, 7, max)?);
 
-            table(self.table.insert_with_literal_name(shared(name), value))
+            table(self.table.insert_with_literal_name(name, value))
         } else if first & 0x20 == 0x20 {
             // Set Dynamic Table Capacity.
             let capacity = decode_int(b, 5)?;
@@ -570,6 +569,32 @@ fn decode_int(b: &mut octets::Octets, prefix: usize) -> Result<u64> {
     Err(Error::BufferTooShort)
 }
 
+/// netweir: a string of an encoder instruction, its Huffman flag just above
+/// its length's `prefix` bits. An entry can't be larger than the table, so
+/// a declared length that couldn't fit in `max` is an error before any of
+/// its bytes are waited for: a Huffman code takes at most 30 bits a byte
+/// (RFC 7541, Appendix B), under 4 times the decoded length.
+fn encoder_str(
+    b: &mut octets::Octets, prefix: usize, max: usize,
+) -> Result<Vec<u8>> {
+    let huff = b.peek_u8()? & (1 << prefix) != 0;
+    let len = decode_int(b, prefix)?;
+
+    let limit = if huff { max.saturating_mul(4) } else { max };
+    if len > limit as u64 {
+        return Err(Error::EncoderStream);
+    }
+
+    let mut val = b.get_bytes(len as usize)?;
+
+    if huff {
+        val.get_huffman_decoded_with_max_length(max)
+            .map_err(|_| Error::EncoderStream)
+    } else {
+        Ok(val.to_vec())
+    }
+}
+
 fn decode_str(b: &mut octets::Octets, max_len: usize) -> Result<Vec<u8>> {
     let first = b.peek_u8()?;
 
@@ -672,6 +697,59 @@ mod tests {
         let mut d = Decoder::with_max_table_capacity(100);
         // Capacity above the advertised maximum.
         assert_eq!(d.control(&mut [0x3f, 0xbd, 0x01]), Err(Error::EncoderStream));
+    }
+
+    // netweir: a string longer than the table could hold is refused as
+    // its length is read, not buffered while the rest is waited for.
+    #[test]
+    fn instruction_longer_than_the_table_is_an_error() {
+        // Insert with Literal Name, a name of 2^35 bytes declared.
+        let mut d = Decoder::with_max_table_capacity(4096);
+        assert_eq!(
+            d.control(&mut [0x5f, 0xff, 0xff, 0xff, 0xff, 0x7f]),
+            Err(Error::EncoderStream)
+        );
+
+        // Insert with Name Reference to static :authority, a value of
+        // 4097 bytes, and with Huffman 16385.
+        let mut d = Decoder::with_max_table_capacity(4096);
+        assert_eq!(
+            d.control(&mut [0xc0, 0x7f, 0x82, 0x1f]),
+            Err(Error::EncoderStream)
+        );
+        let mut d = Decoder::with_max_table_capacity(4096);
+        assert_eq!(
+            d.control(&mut [0xc0, 0xff, 0x82, 0x7f]),
+            Err(Error::EncoderStream)
+        );
+
+        // One that could fit is waited for.
+        let mut d = Decoder::with_max_table_capacity(4096);
+        assert_eq!(d.control(&mut [0xc0, 0xff, 0x81, 0x7f]), Ok(()));
+        assert_eq!(d.partial.len(), 4);
+    }
+
+    // netweir: an instruction arriving a byte at a time is applied, and
+    // only its unfinished part is kept.
+    #[test]
+    fn instruction_in_single_bytes() {
+        let mut d = Decoder::with_max_table_capacity(4096);
+        let mut instructions = vec![0x3f, 0xbd, 0x01, 0x4a];
+        instructions.extend_from_slice(b"custom-key");
+        instructions.push(0x0c);
+        instructions.extend_from_slice(b"custom-value");
+        let mut pending = 0;
+        for (i, byte) in instructions.iter().enumerate() {
+            d.control(&mut [*byte]).unwrap();
+            pending += 1;
+            // Set Dynamic Table Capacity ends at the third byte.
+            if i == 2 || i == instructions.len() - 1 {
+                pending = 0;
+            }
+            assert_eq!(d.partial.len(), pending);
+        }
+        assert_eq!(d.insert_count(), 1);
+        assert!(d.partial.is_empty());
     }
 
     #[test]
