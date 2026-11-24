@@ -14,7 +14,7 @@ opt-level = 3
 [dependencies]
 env_logger = "0.11"
 libfuzzer-sys = "0.4"
-quiche = { path = "../quiche", features = ["fuzzing"] }
+quiche = { path = "../quiche", features = ["fuzzing", "internal"] }
 
 # Prevent this from interfering with workspaces
 [workspace]
@@ -39,6 +39,14 @@ path = "src/packets_posths_server.rs"
 [[bin]]
 name = "qpack_decode"
 path = "src/qpack_decode.rs"
+
+[[bin]]
+name = "qpack_dynamic"
+path = "src/qpack_dynamic.rs"
+
+[[bin]]
+name = "h3_client_qpack"
+path = "src/h3_client_qpack.rs"
 
 [profile.release]
 debug = true
