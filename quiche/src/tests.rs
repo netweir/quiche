@@ -14649,3 +14649,87 @@ fn server_qlog() {
         panic!("expected Qlog event");
     }
 }
+
+// netweir: a client's first flight laid out as Chrome 157's is.
+#[test]
+fn chromium_initial_flight() {
+    let mut layouts = std::collections::HashSet::new();
+    for _ in 0..20 {
+        let mut config = test_utils::Pipe::default_config("cubic").unwrap();
+        config.enable_chromium_initial(true);
+        config.set_max_send_udp_payload_size(1250);
+
+        let mut pipe = test_utils::Pipe::with_client_config(&mut config).unwrap();
+
+        let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+        assert_eq!(flight.len(), 2);
+        let copies: Vec<Vec<u8>> = flight.iter().map(|(d, _)| d.clone()).collect();
+        test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+        let (mut crypto, mut pings, mut layout) = (Vec::new(), 0, Vec::new());
+        for (i, mut datagram) in copies.into_iter().enumerate() {
+            assert_eq!(datagram.len(), 1250);
+            let mut b = octets::OctetsMut::with_slice(&mut datagram);
+            let mut hdr = Header::from_bytes(&mut b, 16).unwrap();
+            assert_eq!(hdr.ty, Type::Initial);
+            assert!(hdr.token.as_deref().unwrap_or_default().is_empty());
+            let len = b.get_varint().unwrap() as usize;
+            assert_eq!(b.off() + len, 1250);
+            let aead = pipe.server.crypto_ctx[packet::Epoch::Initial]
+                .crypto_open
+                .as_ref()
+                .unwrap();
+            packet::decrypt_hdr(&mut b, &mut hdr, aead).unwrap();
+            // Packet numbers start at 1, the first in one byte.
+            assert_eq!(hdr.pkt_num, i as u64 + 1);
+            assert_eq!(hdr.pkt_num_len, i + 1);
+            let mut payload = packet::decrypt_pkt(
+                &mut b,
+                hdr.pkt_num,
+                hdr.pkt_num_len,
+                len,
+                aead,
+            )
+            .unwrap();
+            let mut frames = Vec::new();
+            while payload.cap() > 0 {
+                frames.push(frame::Frame::from_bytes(&mut payload, hdr.ty).unwrap());
+            }
+            for f in &frames {
+                match f {
+                    frame::Frame::Crypto { data } => {
+                        crypto.push((i, data.off(), data.len()))
+                    },
+                    frame::Frame::Ping { .. } => pings += 1,
+                    frame::Frame::Padding { .. } => (),
+                    other => panic!("unexpected frame {other:?}"),
+                }
+                layout.push(format!("{f:?}"));
+            }
+        }
+        // Packet 0 has the start and the end, packet 1 the middle.
+        let first = crypto.iter().filter(|c| c.0 == 0).map(|c| c.1).min();
+        assert_eq!(first, Some(0));
+        let mut sorted: Vec<_> = crypto.iter().map(|c| (c.1, c.2, c.0)).collect();
+        sorted.sort();
+        let mut at = 0;
+        for (off, len, _) in &sorted {
+            assert_eq!(*off, at);
+            at += *len as u64;
+        }
+        let first_len: usize = sorted
+            .iter()
+            .take_while(|c| c.2 == 0)
+            .map(|c| c.1)
+            .sum();
+        assert!((55..87).contains(&first_len));
+        assert!((3..=23).contains(&crypto.len()));
+        assert!((4..=20).contains(&pings));
+        layouts.insert(layout);
+
+        assert_eq!(pipe.advance(), Ok(()));
+        assert!(pipe.client.is_established());
+        assert!(pipe.server.is_established());
+    }
+    assert_eq!(layouts.len(), 20);
+}

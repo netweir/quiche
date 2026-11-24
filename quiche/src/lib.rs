@@ -623,6 +623,8 @@ pub struct Config {
     initial_rtt: Duration,
 
     max_outstanding_sent_packets: Option<NonZeroUsize>,
+
+    chromium_initial: bool,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -706,6 +708,8 @@ impl Config {
             max_outstanding_sent_packets: Some(
                 DEFAULT_MAX_OUTSTANDING_SENT_PACKETS,
             ),
+
+            chromium_initial: false,
         })
     }
 
@@ -960,6 +964,20 @@ impl Config {
     pub fn set_max_idle_timeout(&mut self, v: u64) {
         self.local_transport_params.max_idle_timeout =
             cmp::min(v, octets::MAX_VAR_INT);
+    }
+
+    /// netweir: lays out a client's Initial packets as Chromium's QUIC
+    /// does. The ClientHello is spread over the first packets as
+    /// `QuicPacketCreator::MultiPacketChaosProtect` spreads it, each packet
+    /// carrying its share in CRYPTO frames split, shuffled and mixed with
+    /// PING frames and runs of PADDING by a port of `QuicChaosProtector`,
+    /// and filled to the end with PADDING frames rather than with zero
+    /// bytes after the packet. Packet numbers start at 1, the first in one
+    /// byte and the rest in at least two, as Chrome's do. Clients only.
+    ///
+    /// The default value is `false`.
+    pub fn enable_chromium_initial(&mut self, v: bool) {
+        self.chromium_initial = v;
     }
 
     /// netweir: writes the transport parameters as Chromium's QUIC does
@@ -1690,6 +1708,9 @@ where
     /// The number of tracked sent packets after which the connection is
     /// closed.
     max_outstanding_sent_packets: Option<NonZeroUsize>,
+
+    /// netweir: see `Config::enable_chromium_initial`.
+    chromium_initial: bool,
 }
 
 /// Creates a new server-side connection.
@@ -2163,7 +2184,8 @@ impl<F: BufFactory> Connection<F> {
                 packet::CryptoContext::new(),
             ],
 
-            next_pkt_num: 0,
+            // netweir: Chromium's first packet number is 1.
+            next_pkt_num: u64::from(config.chromium_initial && !is_server),
 
             pkt_num_manager: packet::PktNumManager::new(),
 
@@ -2316,6 +2338,8 @@ impl<F: BufFactory> Connection<F> {
             max_amplification_factor: config.max_amplification_factor,
 
             max_outstanding_sent_packets: config.max_outstanding_sent_packets,
+
+            chromium_initial: config.chromium_initial && !is_server,
         };
         if let Some(retry_cids) = retry_cids {
             conn.local_transport_params
@@ -4532,7 +4556,14 @@ impl<F: BufFactory> Connection<F> {
 
         let largest_acked_pkt =
             path.recovery.get_largest_acked_on_epoch(epoch).unwrap_or(0);
-        let pn_len = packet::pkt_num_len(pn, largest_acked_pkt);
+        let mut pn_len = packet::pkt_num_len(pn, largest_acked_pkt);
+
+        // netweir: Chrome writes its first packet number in one byte and
+        // the next in two, as QuicPacketCreator::UpdatePacketNumberLength
+        // sizes them from the packets its congestion window allows.
+        if self.chromium_initial && pn > 1 {
+            pn_len = cmp::max(pn_len, 2);
+        }
 
         // The AEAD overhead at the current encryption level.
         let crypto_overhead = crypto_ctx.crypto_overhead().ok_or(Error::Done)?;
@@ -5152,6 +5183,93 @@ impl<F: BufFactory> Connection<F> {
                     }
                 }
             }
+        }
+
+        // netweir: a client's Initial packet laid out as Chromium's are.
+        if self.chromium_initial &&
+            pkt_type == Type::Initial &&
+            crypto_ctx.crypto_stream.is_flushable() &&
+            left > frame::MAX_CRYPTO_OVERHEAD &&
+            !is_closing &&
+            path.active()
+        {
+            let send = &mut crypto_ctx.crypto_stream.send;
+            let off = send.off_front();
+            let pending = (send.off_back() - off) as usize;
+
+            let split = if off == 0 {
+                chaos::split_first_flight(left, pending)
+            } else {
+                None
+            };
+
+            let data_len = match split {
+                Some(_) => pending,
+                None => cmp::min(
+                    pending,
+                    left.saturating_sub(chaos::crypto_overhead(
+                        off,
+                        cmp::min(pending, left),
+                    )),
+                ),
+            };
+
+            let mut data = vec![0; data_len];
+            let mut got = 0;
+            while got < data_len {
+                let (n, _) = send.emit(&mut data[got..])?;
+                if n == 0 {
+                    break;
+                }
+                got += n;
+            }
+            data.truncate(got);
+
+            let ranges = match split {
+                // The middle goes out in the packets that follow.
+                Some((first, last)) if got == pending => {
+                    send.retransmit(first as u64, pending - first - last);
+                    vec![(0, first), (pending as u64 - last as u64, last)]
+                },
+
+                _ => vec![(off, got)],
+            };
+
+            let used = chaos::wire_len(&chaos::protect(&ranges, 0));
+            let layout = chaos::protect(&ranges, left - used);
+
+            for f in &layout {
+                match *f {
+                    chaos::Frame::Crypto { offset, len } => {
+                        b.put_varint(0x06)?;
+                        b.put_varint(offset)?;
+                        b.put_varint(len as u64)?;
+                        let at = (offset - off) as usize;
+                        b.put_bytes(&data[at..at + len])?;
+                        frames.push(frame::Frame::CryptoHeader {
+                            offset,
+                            length: len,
+                        });
+                    },
+
+                    chaos::Frame::Ping => {
+                        b.put_varint(0x01)?;
+                        frames.push(frame::Frame::Ping { mtu_probe: None });
+                    },
+
+                    chaos::Frame::Padding(len) => {
+                        for _ in 0..len {
+                            b.put_u8(0)?;
+                        }
+                        frames.push(frame::Frame::Padding { len });
+                    },
+                }
+            }
+
+            left -= chaos::wire_len(&layout);
+            ack_eliciting = true;
+            in_flight = true;
+            has_data = true;
         }
 
         // Create CRYPTO frame.
@@ -6893,7 +7011,10 @@ impl<F: BufFactory> Connection<F> {
             .map(|p| p.recovery.max_datagram_size());
 
         if let Some(max_datagram_size) = max_datagram_size {
-            if self.is_established() {
+            // netweir: Chrome's handshake datagrams are its full packet
+            // size, 1250 bytes over IPv4 (quic_constants.h,
+            // kDefaultMaxPacketSize), not the 1200-byte minimum.
+            if self.is_established() || self.chromium_initial {
                 // Cap the packet size at 16,383 bytes so a two-byte varint can
                 // always encode it.
                 return cmp::min(16383, max_datagram_size);
@@ -9811,6 +9932,7 @@ pub use crate::error::Result;
 pub use crate::error::WireErrorCode;
 
 mod buffers;
+mod chaos;
 mod cid;
 mod crypto;
 mod dgram;
