@@ -14885,7 +14885,8 @@ fn chromium_initial_flight_first_packets_lost() {
 }
 
 // netweir: a client writing its parameters as Safari 27 was recorded
-// writing them: ascending from a random one, no GREASE, defaults left out.
+// writing them: ascending from a random one, no GREASE, defaults left out,
+// and starting at each one about as often as Safari's 53 connections did.
 #[test]
 fn transport_params_safari_encoding() {
     let tp = TransportParams {
@@ -14901,8 +14902,11 @@ fn transport_params_safari_encoding() {
     };
 
     let ascending = [4, 5, 6, 7, 9, 0xe, 0xf];
-    let mut starts = std::collections::HashSet::new();
-    for _ in 0..200 {
+    // Safari's starts out of 53, by id.
+    let recorded = [(4, 21), (5, 2), (6, 4), (7, 2), (9, 5), (0xe, 14), (0xf, 5)];
+    let draws = 53 * 200;
+    let mut starts = std::collections::HashMap::new();
+    for _ in 0..draws {
         let mut raw = [0; 256];
         let raw = TransportParams::encode(&tp, false, &mut raw).unwrap();
         let mut b = octets::Octets::with_slice(raw);
@@ -14915,13 +14919,22 @@ fn transport_params_safari_encoding() {
         let mut rotated = ascending.to_vec();
         rotated.rotate_left(at);
         assert_eq!(ids, rotated);
-        starts.insert(at);
+        *starts.entry(ids[0]).or_insert(0) += 1;
 
         let decoded = TransportParams::decode(raw, true, None).unwrap();
         assert_eq!(decoded.active_conn_id_limit, 64);
         assert_eq!(decoded.max_ack_delay, 25);
     }
-    assert_eq!(starts.len(), ascending.len());
+    // Each within a quarter of what the weights give: at least five
+    // standard deviations for the rarest, so this doesn't fail by chance.
+    for (id, n) in recorded {
+        let expected = n * 200;
+        let got = starts.get(&id).copied().unwrap_or(0);
+        assert!(
+            got * 4 >= expected * 3 && got * 4 <= expected * 5,
+            "parameter {id:#x} started {got} times in {draws}, not about {expected}"
+        );
+    }
 }
 
 // netweir: a client's first flight laid out as Safari 27's was recorded:

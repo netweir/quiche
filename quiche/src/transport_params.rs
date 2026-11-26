@@ -564,7 +564,7 @@ impl TransportParams {
         if safari && !params.is_empty() {
             // In ascending order, starting at a random one.
             params.sort_by_key(|p| p.0);
-            let at = (crate::rand::rand_u64() % params.len() as u64) as usize;
+            let at = safari_start(&params);
             params.rotate_left(at);
         }
 
@@ -641,4 +641,42 @@ impl TransportParams {
             },
         ))
     }
+}
+
+/// How often Safari 27.2's QUIC started its transport parameters at each
+/// one, over 53 recorded connections (netweir's docs/design/http3.md):
+/// initial_max_data 21 times, active_connection_id_limit 14,
+/// initial_max_streams_uni and initial_source_connection_id 5 each,
+/// initial_max_stream_data_bidi_remote 4, and the two other stream data
+/// limits 2 each.
+const SAFARI_STARTS: [(u64, u64); 7] = [
+    (0x04, 21),
+    (0x0e, 14),
+    (0x09, 5),
+    (0x0f, 5),
+    (0x06, 4),
+    (0x05, 2),
+    (0x07, 2),
+];
+
+/// Where in `params`, sorted by id, Safari's order starts: drawn with the
+/// recorded weights when `params` holds just the parameters recorded,
+/// and evenly otherwise, since nothing is known of another set.
+fn safari_start(params: &[(u64, Vec<u8>)]) -> usize {
+    let recorded = params.len() == SAFARI_STARTS.len() &&
+        params
+            .iter()
+            .all(|(id, _)| SAFARI_STARTS.iter().any(|(s, _)| s == id));
+    if !recorded {
+        return (crate::rand::rand_u64() % params.len() as u64) as usize;
+    }
+    let total: u64 = SAFARI_STARTS.iter().map(|(_, n)| n).sum();
+    let mut pick = crate::rand::rand_u64() % total;
+    for (id, n) in SAFARI_STARTS {
+        if pick < n {
+            return params.iter().position(|(p, _)| *p == id).unwrap_or(0);
+        }
+        pick -= n;
+    }
+    0
 }
