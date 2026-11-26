@@ -42,6 +42,9 @@ behaviour comes from:
   opened before they're needed, Chrome's PRIORITY_UPDATE values.
 - QPACK: the decoder fills and uses the dynamic table, and acknowledges it.
 - No libc cap, which clashed with Netweir's lockfile.
+- Early data a server turns down goes again as soon as the handshake is
+  done, as QUICHE's `QuicSession::OnZeroRttRejected` has it, rather than
+  once loss detection calls it lost.
 
 On the `safari-27` branch, which builds on `chrome-157`, three more options
 lay a connection out as a recording of Safari 27.2 on macOS showed it.
@@ -59,7 +62,8 @@ these follow the recording rather than the code:
   after them.
 
 None of it changes quiche unless it's turned on, except the QPACK decoder,
-plain AES-GCM, and the pruned workspace. Congestion control, pacing and
+plain AES-GCM, the resend of early data turned down, and the pruned
+workspace. Congestion control, pacing and
 loss recovery are quiche's own. The licence is unchanged: BSD-2-Clause, in
 [COPYING](COPYING).
 
