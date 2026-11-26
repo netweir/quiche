@@ -241,6 +241,16 @@ pub trait RecoveryOps {
         &mut self, epoch: packet::Epoch, handshake_status: HandshakeStatus,
         now: Instant,
     );
+
+    /// Takes every application packet not yet acknowledged or lost out of
+    /// flight and queues its frames to be sent again, for a server that
+    /// turned early data down: until 1-RTT keys are in, each such packet
+    /// went in 0-RTT. Not a loss to congestion control, as in QUICHE's
+    /// QuicSentPacketManager::MarkZeroRttPacketsForRetransmission (called
+    /// from QuicSession::OnZeroRttRejected).
+    fn on_zero_rtt_rejected(
+        &mut self, handshake_status: HandshakeStatus, now: Instant,
+    );
     fn on_path_change(
         &mut self, epoch: packet::Epoch, now: Instant, _trace_id: &str,
     ) -> (usize, usize);

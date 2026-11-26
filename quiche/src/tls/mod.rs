@@ -370,6 +370,8 @@ pub struct Handshake {
     /// SSL_process_quic_post_handshake should be called when whenever
     /// SSL_provide_quic_data is called to process the provided data.
     provided_data_outstanding: bool,
+    /// The server turned early data down since this was last asked.
+    early_data_rejected: bool,
 }
 
 impl Handshake {
@@ -386,6 +388,7 @@ impl Handshake {
         Handshake {
             ptr,
             provided_data_outstanding: false,
+            early_data_rejected: false,
         }
     }
 
@@ -551,6 +554,12 @@ impl Handshake {
         self.map_result_ssl(rc)
     }
 
+    /// Whether the server turned early data down since this was last
+    /// asked.
+    pub fn take_early_data_rejected(&mut self) -> bool {
+        std::mem::take(&mut self.early_data_rejected)
+    }
+
     pub fn do_handshake(&mut self, ex_data: &mut ExData) -> Result<()> {
         self.set_ex_data(*QUICHE_EX_DATA_INDEX, ex_data)?;
         let rc = unsafe { SSL_do_handshake(self.as_mut_ptr()) };
@@ -656,6 +665,7 @@ impl Handshake {
                     // SSL_ERROR_EARLY_DATA_REJECTED
                     15 => {
                         self.reset_early_data_reject();
+                        self.early_data_rejected = true;
                         Err(Error::Done)
                     },
 

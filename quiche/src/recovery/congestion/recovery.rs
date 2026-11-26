@@ -871,6 +871,34 @@ impl RecoveryOps for LegacyRecovery {
         self.set_loss_detection_timer(handshake_status, now);
     }
 
+    fn on_zero_rtt_rejected(
+        &mut self, handshake_status: HandshakeStatus, now: Instant,
+    ) {
+        let RecoveryEpoch {
+            sent_packets,
+            lost_frames_ack,
+            in_flight_count,
+            ..
+        } = &mut self.epochs[Epoch::Application];
+        let mut unacked_bytes = 0;
+
+        for p in sent_packets
+            .iter_mut()
+            .filter(|p| p.time_acked.is_none() && p.time_lost.is_none())
+        {
+            lost_frames_ack.extend(p.frames.drain(..));
+            p.time_lost = Some(now);
+
+            if p.in_flight {
+                unacked_bytes += p.size;
+                *in_flight_count -= 1;
+            }
+        }
+
+        self.bytes_in_flight.saturating_subtract(unacked_bytes, now);
+        self.set_loss_detection_timer(handshake_status, now);
+    }
+
     fn on_path_change(
         &mut self, epoch: Epoch, now: Instant, trace_id: &str,
     ) -> (usize, usize) {

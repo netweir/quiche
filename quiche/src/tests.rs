@@ -1290,6 +1290,70 @@ fn streamio_mixed_actions(
     assert!(pipe.server.stream_finished(4));
 }
 
+/// netweir: data sent in 0-RTT that the server turns down goes again as
+/// soon as the handshake is done, without waiting for loss detection, as
+/// QUICHE's QuicSession::OnZeroRttRejected has it.
+#[rstest]
+fn zero_rtt_rejected_is_sent_again_at_once(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let new_config = || {
+        let mut config = test_utils::config_no_pq(PROTOCOL_VERSION).unwrap();
+        assert_eq!(config.set_cc_algorithm_name(cc_algorithm_name), Ok(()));
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(&[b"proto1", b"proto2"])
+            .unwrap();
+        config.set_initial_max_data(30);
+        config.set_initial_max_stream_data_bidi_local(15);
+        config.set_initial_max_stream_data_bidi_remote(15);
+        config.set_initial_max_streams_bidi(3);
+        config.enable_early_data();
+        config.verify_peer(false);
+        config
+    };
+    let mut config = new_config();
+
+    let mut pipe = test_utils::Pipe::with_config(&mut config).unwrap();
+    assert_eq!(pipe.handshake(), Ok(()));
+    let session = pipe.client.session().unwrap();
+
+    // A server with a context of its own knows nothing of the session, so
+    // it turns the early data down.
+    let mut other = new_config();
+    let mut pipe =
+        test_utils::Pipe::with_client_and_server_config(&mut config, &mut other)
+            .unwrap();
+    assert_eq!(pipe.client.set_session(session), Ok(()));
+    let mut buf = [0; 65535];
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let mut initial = buf[..len].to_vec();
+    assert!(pipe.client.is_in_early_data());
+    assert_eq!(pipe.client.stream_send(4, b"hello, world", true), Ok(12));
+    let (len, _) = pipe.client.send(&mut buf).unwrap();
+    let mut early = buf[..len].to_vec();
+    assert_eq!(pipe.server_recv(&mut initial), Ok(initial.len()));
+    // Turned down: the server can't read it.
+    let _ = pipe.server_recv(&mut early);
+
+    // The handshake, with no timer fired: what went in 0-RTT is already
+    // there once it's done.
+    assert_eq!(pipe.advance(), Ok(()));
+    assert!(pipe.client.is_established() && pipe.server.is_established());
+    assert!(!pipe.client.is_in_early_data());
+
+    let mut r = pipe.server.readable();
+    assert_eq!(r.next(), Some(4));
+    let mut b = [0; 15];
+    assert_eq!(pipe.server.stream_recv(4, &mut b), Ok((12, true)));
+    assert_eq!(&b[..12], b"hello, world");
+}
+
 #[rstest]
 fn zero_rtt(#[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str) {
     let mut buf = [0; 65535];

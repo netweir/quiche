@@ -1015,6 +1015,43 @@ impl RecoveryOps for GRecovery {
         self.set_loss_detection_timer(handshake_status, now);
     }
 
+    fn on_zero_rtt_rejected(
+        &mut self, handshake_status: HandshakeStatus, now: Instant,
+    ) {
+        let RecoveryEpoch {
+            sent_packets,
+            lost_frames_ack,
+            pkts_in_flight,
+            ..
+        } = &mut self.epochs[packet::Epoch::Application];
+        let mut unacked_bytes = 0;
+
+        for SentPacket { pkt_num, status } in sent_packets.iter_mut() {
+            if !matches!(status, SentStatus::Sent { .. }) {
+                continue;
+            }
+
+            if let SentStatus::Sent {
+                in_flight,
+                sent_bytes,
+                frames,
+                ..
+            } = status.lose()
+            {
+                lost_frames_ack.extend(frames);
+
+                if in_flight {
+                    *pkts_in_flight -= 1;
+                    unacked_bytes += sent_bytes;
+                    self.pacer.on_packet_neutered(*pkt_num);
+                }
+            }
+        }
+
+        self.bytes_in_flight.saturating_subtract(unacked_bytes, now);
+        self.set_loss_detection_timer(handshake_status, now);
+    }
+
     fn on_path_change(
         &mut self, epoch: packet::Epoch, now: Instant, _trace_id: &str,
     ) -> (usize, usize) {
