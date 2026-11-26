@@ -8395,6 +8395,8 @@ impl<F: BufFactory> Connection<F> {
                 Err(e) => return Err(e),
             };
 
+        let early_data_rejected = self.handshake.take_early_data_rejected();
+
         // BoringSSL reports success when entering early data before the
         // handshake completes. Apply callback configuration after either
         // non-fatal outcome so it is not lost on that path.
@@ -8444,6 +8446,17 @@ impl<F: BufFactory> Connection<F> {
                 );
 
                 self.local_transport_params = ex_data.local_transport_params;
+            }
+        }
+
+        // The server turned early data down: what went in 0-RTT is sent
+        // again at once, once the 1-RTT keys are in, rather than after loss
+        // detection calls it lost (QuicSession::OnZeroRttRejected).
+        if early_data_rejected {
+            let handshake_status = self.handshake_status();
+
+            for (_, p) in self.paths.iter_mut() {
+                p.recovery.on_zero_rtt_rejected(handshake_status, now);
             }
         }
 
