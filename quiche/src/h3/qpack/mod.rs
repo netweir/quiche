@@ -28,6 +28,7 @@
 
 pub use encoder::encode_int;
 pub use encoder::encode_str;
+pub use encoder::Mode;
 
 pub const INDEXED: u8 = 0b1000_0000;
 pub const INDEXED_WITH_POST_BASE: u8 = 0b0001_0000;
@@ -71,6 +72,10 @@ pub enum Error {
     /// netweir: a prefixed integer didn't fit in 64 bits (RFC 9204,
     /// Section 4.1.1).
     IntegerOverflow,
+
+    /// netweir: a decoder instruction couldn't be applied (RFC 9204,
+    /// Section 4.4): QPACK_DECODER_STREAM_ERROR.
+    DecoderStream,
 }
 
 impl std::fmt::Display for Error {
