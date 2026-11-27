@@ -688,10 +688,12 @@ impl Encoder {
     }
 
     /// Whether a string is Huffman-coded only when that's shorter, as
-    /// QUICHE's `QpackInstructionEncoder` does, rather than when it's no
+    /// QUICHE's `QpackInstructionEncoder` does and Safari 27.2 was
+    /// recorded doing (profiles/safari-27-macos.h3-qpack-ties: `?0`,
+    /// `&&&&`, `&&` and `1` sent as they are), rather than when it's no
     /// longer, as upstream quiche does.
     fn huffman_strict(&self) -> bool {
-        self.mode == Mode::Chromium
+        matches!(self.mode, Mode::Chromium | Mode::Safari)
     }
 
     /// QUICHE's `QpackEncoder::SecondPassEncode`: the prefix, then each
@@ -1486,7 +1488,7 @@ mod tests {
         assert_eq!(enc.take_instructions(), capacity, "65536, not 1 MiB");
         let mut expected = vec![0, 0, 0xd1];
         encode_int_vec(0, LITERAL_WITH_NAME_REF | 0x10, 4, &mut expected);
-        encode_string_vec(b"localhost", 0, 7, false, false, &mut expected);
+        encode_string_vec(b"localhost", 0, 7, false, true, &mut expected);
         encode_string_vec(
             b"sec-fetch-mode",
             LITERAL,
@@ -1495,7 +1497,7 @@ mod tests {
             false,
             &mut expected,
         );
-        encode_string_vec(b"cors", 0, 7, false, false, &mut expected);
+        encode_string_vec(b"cors", 0, 7, false, true, &mut expected);
         expected.push(0xc0 | 29);
         assert_eq!(first, expected);
 
@@ -1504,9 +1506,9 @@ mod tests {
         // encoded 3; sign 1, delta 1).
         let second = encode_on(&mut enc, 4, FETCH);
         let mut inserts = vec![0xc0];
-        encode_string_vec(b"localhost", 0, 7, false, false, &mut inserts);
-        encode_string_vec(b"sec-fetch-mode", 0x40, 5, true, false, &mut inserts);
-        encode_string_vec(b"cors", 0, 7, false, false, &mut inserts);
+        encode_string_vec(b"localhost", 0, 7, false, true, &mut inserts);
+        encode_string_vec(b"sec-fetch-mode", 0x40, 5, true, true, &mut inserts);
+        encode_string_vec(b"cors", 0, 7, false, true, &mut inserts);
         assert_eq!(enc.take_instructions(), inserts);
         assert_eq!(second, [0x03, 0x81, 0xd1, 0x10, 0x11, 0xc0 | 29]);
 
@@ -1526,12 +1528,12 @@ mod tests {
         // First time for "no-cors": the dynamic entry's name.
         let first = encode_on(&mut enc, 8, &[(b"sec-fetch-mode", b"no-cors")]);
         let mut expected = vec![0x02, 0x00, LITERAL_WITH_NAME_REF];
-        encode_string_vec(b"no-cors", 0, 7, false, false, &mut expected);
+        encode_string_vec(b"no-cors", 0, 7, false, true, &mut expected);
         assert_eq!(first, expected);
         // Second: inserted with that name, relative 0.
         encode_on(&mut enc, 12, &[(b"sec-fetch-mode", b"no-cors")]);
         let mut inserts = vec![0x80];
-        encode_string_vec(b"no-cors", 0, 7, false, false, &mut inserts);
+        encode_string_vec(b"no-cors", 0, 7, false, true, &mut inserts);
         assert_eq!(enc.take_instructions(), inserts);
     }
 
@@ -1564,6 +1566,15 @@ mod tests {
         let block = encode_on(&mut enc, 4, FETCH);
         assert!(enc.take_instructions().is_empty());
         assert_eq!(&block[..2], [0, 0]);
+    }
+
+    #[test]
+    fn safari_sends_a_tie_as_it_is() {
+        // "?0" and "&&" code to 15 and 16 bits in Huffman: no shorter, so
+        // Safari sent them as they are (profiles/safari-27-macos.h3-qpack-ties).
+        let mut enc = safari(100);
+        let block = encode_on(&mut enc, 0, &[(b"&&", b"?0")]);
+        assert_eq!(block, [0, 0, LITERAL | 2, b'&', b'&', 2, b'?', b'0']);
     }
 
     #[test]
