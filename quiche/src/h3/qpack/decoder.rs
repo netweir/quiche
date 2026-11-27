@@ -548,7 +548,7 @@ fn lookup_static(idx: u64) -> Result<(&'static [u8], &'static [u8])> {
     Ok(super::static_table::STATIC_DECODE_TABLE[idx as usize])
 }
 
-fn decode_int(b: &mut octets::Octets, prefix: usize) -> Result<u64> {
+pub(super) fn decode_int(b: &mut octets::Octets, prefix: usize) -> Result<u64> {
     let mask = 2u64.pow(prefix as u32) - 1;
 
     let mut val = u64::from(b.get_u8()?);

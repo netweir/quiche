@@ -408,6 +408,10 @@ pub enum Error {
     /// be applied.
     QpackEncoderStreamError,
 
+    /// netweir: an instruction on the peer's QPACK decoder stream couldn't
+    /// be applied.
+    QpackDecoderStreamError,
+
     /// Error originated from the transport layer.
     TransportError(crate::Error),
 
@@ -517,6 +521,8 @@ impl Error {
             Error::MissingSettings => WireErrorCode::MissingSettings as u64,
             Error::QpackDecompressionFailed => 0x200,
             Error::QpackEncoderStreamError => 0x201,
+
+            Error::QpackDecoderStreamError => 0x202,
             Error::BufferTooShort => 0x999,
             Error::TransportError { .. } | Error::StreamBlocked => 0xFF,
             Error::SettingsError => WireErrorCode::SettingsError as u64,
@@ -553,6 +559,7 @@ impl Error {
             Error::ConnectError => -19,
             Error::VersionFallback => -20,
             Error::QpackEncoderStreamError => -21,
+            Error::QpackDecoderStreamError => -22,
 
             Error::TransportError(quic_error) => quic_error.to_c() - 1000,
         }
@@ -1081,6 +1088,9 @@ pub struct Connection {
 
     /// netweir: decoder instructions the decoder stream couldn't take yet.
     decoder_out: Vec<u8>,
+
+    /// netweir: encoder instructions the encoder stream couldn't take yet.
+    encoder_out: Vec<u8>,
 }
 
 impl Connection {
@@ -1122,7 +1132,17 @@ impl Connection {
             control_stream_id: None,
             peer_control_stream_id: None,
 
-            qpack_encoder: qpack::Encoder::new(),
+            // netweir: Chromium's encoder lets a server's table grow to its
+            // own SETTINGS_QPACK_MAX_TABLE_CAPACITY (quic_spdy_session.cc,
+            // OnSetting).
+            qpack_encoder: if config.chromium && !is_server {
+                qpack::Encoder::with_mode(
+                    qpack::Mode::Chromium,
+                    config.qpack_max_table_capacity.unwrap_or(0),
+                )
+            } else {
+                qpack::Encoder::new()
+            },
             qpack_decoder: qpack::Decoder::with_max_table_capacity(
                 config.qpack_max_table_capacity.unwrap_or(0),
             ),
@@ -1148,6 +1168,8 @@ impl Connection {
             unblocked: VecDeque::new(),
 
             decoder_out: Vec::new(),
+
+            encoder_out: Vec::new(),
         })
     }
 
@@ -1529,7 +1551,7 @@ impl Connection {
     }
 
     fn encode_header_block<T: NameValue>(
-        &mut self, headers: &[T],
+        &mut self, stream_id: u64, headers: &[T],
     ) -> Result<Vec<u8>> {
         let headers_len = headers
             .iter()
@@ -1538,7 +1560,7 @@ impl Connection {
         let mut header_block = vec![0; headers_len];
         let len = self
             .qpack_encoder
-            .encode(headers, &mut header_block)
+            .encode_for_stream(stream_id, headers, &mut header_block)
             .map_err(|_| Error::InternalError)?;
 
         header_block.truncate(len);
@@ -1558,7 +1580,11 @@ impl Connection {
             self.frames_greased = true;
         }
 
-        let header_block = self.encode_header_block(headers)?;
+        let header_block = self.encode_header_block(stream_id, headers)?;
+
+        // netweir: the inserts this field section refers to go out on the
+        // encoder stream first, as QUICHE flushes them while it encodes.
+        self.flush_qpack_encoder(conn);
 
         let overhead = octets::varint_len(frame::HEADERS_FRAME_TYPE_ID) +
             octets::varint_len(header_block.len() as u64);
@@ -2770,6 +2796,33 @@ impl Connection {
         }
     }
 
+    /// netweir: sends the QPACK encoder's instructions, opening the
+    /// encoder stream first if it isn't open yet, as Chromium opens it only
+    /// once it has something to send (qpack_send_stream.cc,
+    /// MaybeSendStreamType).
+    fn flush_qpack_encoder<F: BufFactory>(
+        &mut self, conn: &mut super::Connection<F>,
+    ) {
+        self.encoder_out
+            .extend_from_slice(&self.qpack_encoder.take_instructions());
+
+        if self.encoder_out.is_empty() {
+            return;
+        }
+
+        if self.local_qpack_streams.encoder_stream_id.is_none() &&
+            self.open_qpack_encoder_stream(conn).is_err()
+        {
+            return;
+        }
+
+        if let Some(id) = self.local_qpack_streams.encoder_stream_id {
+            if let Ok(n) = conn.stream_send(id, &self.encoder_out, false) {
+                self.encoder_out.drain(..n);
+            }
+        }
+    }
+
     /// netweir: SETTINGS and a GREASE frame on the control stream, as
     /// Chromium sends them (see `Config::enable_chromium`).
     fn send_chromium_settings<F: BufFactory>(
@@ -3224,9 +3277,25 @@ impl Connection {
                                     return Err(e);
                                 }
                             },
-                            Some(stream::Type::QpackDecoder) =>
+                            Some(stream::Type::QpackDecoder) => {
                                 self.peer_qpack_streams.decoder_stream_bytes +=
-                                    recv as u64,
+                                    recv as u64;
+
+                                // netweir: acknowledgments for the encoder.
+                                if self
+                                    .qpack_encoder
+                                    .on_decoder_stream(&d[..recv])
+                                    .is_err()
+                                {
+                                    let e = Error::QpackDecoderStreamError;
+                                    conn.close(
+                                        true,
+                                        e.to_wire(),
+                                        b"Error in QPACK decoder instruction.",
+                                    )?;
+                                    return Err(e);
+                                }
+                            },
                             _ => unreachable!(),
                         };
 
@@ -3421,6 +3490,10 @@ impl Connection {
                 raw,
                 ..
             } => {
+                // netweir: the encoder learns the table it may fill.
+                self.qpack_encoder
+                    .on_peer_settings(qpack_max_table_capacity, qpack_blocked_streams);
+
                 self.peer_settings = ConnectionSettings {
                     max_field_section_size,
                     qpack_max_table_capacity,
@@ -4620,6 +4693,39 @@ mod tests {
     }
 
     #[test]
+    /// netweir: a Chromium client fills the server's dynamic table and
+    /// refers to it, and the server's decoder reads every request back.
+    fn chromium_requests_use_the_servers_dynamic_table() {
+        let (mut config, mut h3_config) = Session::default_configs().unwrap();
+        h3_config.set_qpack_max_table_capacity(4096);
+        h3_config.set_qpack_blocked_streams(16);
+        h3_config.enable_chromium(true);
+        let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
+        s.handshake().unwrap();
+
+        for _ in 0..2 {
+            let (stream, req) = s.send_request(true).unwrap();
+            let ev_headers = Event::Headers {
+                list: req,
+                more_frames: false,
+            };
+            assert_eq!(s.poll_server(), Ok((stream, ev_headers)));
+            assert_eq!(s.poll_server(), Ok((stream, Event::Finished)));
+        }
+
+        // The second request referred to what the first inserted.
+        let inserted = s.server.peer_qpack_streams.encoder_stream_bytes;
+        assert!(inserted > 0, "nothing on the encoder stream");
+        let (stream, _) = s.send_request(true).unwrap();
+        s.poll_server().unwrap();
+        s.poll_server().unwrap();
+        assert_eq!(
+            s.server.peer_qpack_streams.encoder_stream_bytes, inserted,
+            "stream {stream} inserted again"
+        );
+    }
+
+    #[test]
     /// Send a request with no body, get a response with one DATA frame.
     fn request_no_body_response_one_chunk() {
         let mut s = Session::new().unwrap();
@@ -5554,7 +5660,7 @@ mod tests {
 
         let (stream, req) = s.send_request(false).unwrap();
 
-        let header_block = s.client.encode_header_block(&req).unwrap();
+        let header_block = s.client.encode_header_block(stream, &req).unwrap();
 
         s.send_frame_client(
             frame::Frame::PushPromise {
