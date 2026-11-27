@@ -61,6 +61,14 @@ pub enum Mode {
     /// allowed to block, it still inserts but refers only to entries the
     /// peer has acknowledged, and leaves out an insert that would name a
     /// dynamic entry.
+    ///
+    /// In a small table (profiles/safari-27-macos.h3-qpack-{N}b, 128 to
+    /// 2048 bytes) it stops inserting into a section once it has inserted
+    /// half the table's size, copies an entry it would refer to from the
+    /// oldest that leave 35% of the table free above them, even where the
+    /// copy evicts it, puts a name only such an entry has in again with an
+    /// empty value, and inserts under that name literally. No rule fits
+    /// every size recorded; this one fits the most.
     Safari,
 }
 
@@ -68,6 +76,11 @@ pub enum Mode {
 /// when the server offered 1 MiB, whatever its own
 /// SETTINGS_QPACK_MAX_TABLE_CAPACITY (16383).
 pub const SAFARI_MAX_TABLE_CAPACITY: u64 = 65536;
+
+/// netweir: the share of Safari's table it keeps free above the entries it
+/// still refers to: the best fit to Safari 27.2 against tables of 128 to
+/// 2048 bytes (netweir/netweir, profiles/safari-27-macos.h3-qpack-{N}b).
+const SAFARI_DRAINING: f64 = 0.35;
 
 /// A QPACK encoder.
 #[derive(Default)]
@@ -520,33 +533,46 @@ impl Encoder {
             |index: u64| blocking_allowed || index < known_received_count;
 
         // Entries an unacknowledged section needs, or the peer may not
-        // have yet, aren't evicted.
-        // shortcut: Safari's eviction wasn't recorded (no table filled);
-        // this is QUICHE's rule, until a recording fills one.
+        // have yet, aren't evicted, nor any this section refers to.
         let mut smallest_non_evictable_index = self
             .blocking
             .smallest_blocking_index()
             .min(known_received_count);
 
+        // Safari stops inserting into a section once it has inserted half
+        // the table's size.
+        let budget = self.table.capacity / 2;
+        let mut spent = 0;
+
         for (name, value) in split_values(headers) {
             let found = self.table.find(&name, &value);
 
-            match found {
-                Match::NameAndValue {
+            if let Match::NameAndValue {
+                is_static: true,
+                index,
+            } = found
+            {
+                representations.push(Representation::Indexed {
                     is_static: true,
                     index,
-                } => {
-                    representations.push(Representation::Indexed {
-                        is_static: true,
-                        index,
-                    });
-                    continue;
-                },
+                });
+                continue;
+            }
 
-                Match::NameAndValue {
-                    is_static: false,
-                    index,
-                } if referable(index) => {
+            let again =
+                usable && !self.sent.insert((name.clone(), value.clone()));
+            let size = entry_size(&name, &value);
+
+            // The oldest entries drain, as many as leave SAFARI_DRAINING
+            // of the table free above them, counted afresh for each field.
+            let draining_index = self.table.draining_index(SAFARI_DRAINING);
+
+            if let Match::NameAndValue {
+                is_static: false,
+                index,
+            } = found
+            {
+                if index >= draining_index && referable(index) {
                     representations.push(Representation::Indexed {
                         is_static: false,
                         index,
@@ -554,78 +580,87 @@ impl Encoder {
                     smallest_non_evictable_index =
                         smallest_non_evictable_index.min(index);
                     continue;
-                },
+                }
 
-                _ => (),
+                // A draining entry is copied, even where the copy evicts
+                // it (RFC 9204, Section 3.2.2), unlike QUICHE, and then
+                // kept for the rest of the section.
+                let room = self.table.max_insert_size_without_evicting(
+                    smallest_non_evictable_index,
+                );
+
+                if index < draining_index &&
+                    blocking_allowed &&
+                    spent < budget &&
+                    size <= room
+                {
+                    let relative = self.table.inserted() - index - 1;
+                    encode_int_vec(relative, 0x00, 5, &mut self.instructions);
+                    let new_index = self.table.insert(&name, &value);
+                    spent += size;
+                    representations.push(Representation::Indexed {
+                        is_static: false,
+                        index: new_index,
+                    });
+                    smallest_non_evictable_index = smallest_non_evictable_index
+                        .min(new_index)
+                        .min(index.max(self.table.dropped));
+                    continue;
+                }
             }
 
             let in_table = matches!(found, Match::NameAndValue { .. });
-            let again =
-                usable && !self.sent.insert((name.clone(), value.clone()));
             let by_name = self.table.find_name(&name);
+            let mut tried = false;
 
-            if again && !in_table {
-                let size = entry_size(&name, &value);
+            if again && !in_table && spent < budget {
+                tried = true;
 
-                let inserted = match by_name {
-                    Match::Name {
-                        is_static: true,
-                        index,
-                    } if size <=
-                        self.table.max_insert_size_without_evicting(
-                            smallest_non_evictable_index,
-                        ) =>
-                    {
-                        self.insert_with_name_reference(true, index, &value);
-                        true
-                    },
+                let room = self.table.max_insert_size_without_evicting(
+                    smallest_non_evictable_index,
+                );
 
-                    Match::Name {
-                        is_static: false,
-                        index,
-                    } if blocking_allowed &&
-                        size <= self
-                            .table
-                            .max_insert_size_without_evicting(
-                                smallest_non_evictable_index.min(index),
-                            ) =>
-                    {
-                        let relative = self.table.inserted() - index - 1;
-                        self.insert_with_name_reference(false, relative, &value);
-                        true
-                    },
+                let inserted = size <= room &&
+                    match by_name {
+                        Match::Name {
+                            is_static: true,
+                            index,
+                        } => {
+                            self.insert_with_name_reference(true, index, &value);
+                            true
+                        },
 
-                    Match::None
-                        if size <=
-                            self.table.max_insert_size_without_evicting(
-                                smallest_non_evictable_index,
-                            ) =>
-                    {
-                        // Insert With Literal Name.
-                        encode_string_vec(
-                            &name,
-                            0x40,
-                            5,
-                            true,
-                            self.huffman_strict(),
-                            &mut self.instructions,
-                        );
-                        encode_string_vec(
-                            &value,
-                            0x00,
-                            7,
-                            false,
-                            self.huffman_strict(),
-                            &mut self.instructions,
-                        );
-                        true
-                    },
+                        // A name only a draining entry has goes in
+                        // literally.
+                        Match::Name {
+                            is_static: false,
+                            index,
+                        } if blocking_allowed && index >= draining_index => {
+                            let relative = self.table.inserted() - index - 1;
+                            self.insert_with_name_reference(
+                                false, relative, &value,
+                            );
+                            true
+                        },
 
-                    _ => false,
-                };
+                        Match::Name {
+                            is_static: false, ..
+                        } if blocking_allowed => {
+                            self.insert_with_literal_name(&name, &value);
+                            true
+                        },
+
+                        Match::None => {
+                            self.insert_with_literal_name(&name, &value);
+                            true
+                        },
+
+                        _ => false,
+                    };
 
                 if inserted {
                     let new_index = self.table.insert(&name, &value);
+                    spent += size;
 
                     if blocking_allowed {
                         representations.push(Representation::Indexed {
@@ -640,7 +675,8 @@ impl Encoder {
             }
 
             // As the field is sent the first time: its name from a table,
-            // else literals.
+            // else literals. A name only a draining entry has goes in
+            // again with an empty value, to be referred to.
             match self.table.find_name(&name) {
                 Match::Name {
                     is_static: true,
@@ -654,7 +690,7 @@ impl Encoder {
                 Match::Name {
                     is_static: false,
                     index,
-                } if referable(index) => {
+                } if index >= draining_index && referable(index) => {
                     representations.push(Representation::NameReference {
                         is_static: false,
                         index,
@@ -664,12 +700,41 @@ impl Encoder {
                         smallest_non_evictable_index.min(index);
                 },
 
+                Match::Name {
+                    is_static: false, ..
+                } if !tried &&
+                    blocking_allowed &&
+                    spent < budget &&
+                    entry_size(&name, b"") <=
+                        self.table.max_insert_size_without_evicting(
+                            smallest_non_evictable_index,
+                        ) =>
+                {
+                    self.insert_with_literal_name(&name, b"");
+                    let new_index = self.table.insert(&name, b"");
+                    spent += entry_size(&name, b"");
+                    representations.push(Representation::NameReference {
+                        is_static: false,
+                        index: new_index,
+                        value,
+                    });
+                    smallest_non_evictable_index =
+                        smallest_non_evictable_index.min(new_index);
+                },
+
                 _ =>
                     representations.push(Representation::Literal { name, value }),
             }
         }
 
         representations
+    }
+
+    /// Queues an Insert With Literal Name.
+    fn insert_with_literal_name(&mut self, name: &[u8], value: &[u8]) {
+        let strict = self.huffman_strict();
+        encode_string_vec(name, 0x40, 5, true, strict, &mut self.instructions);
+        encode_string_vec(value, 0x00, 7, false, strict, &mut self.instructions);
     }
 
     fn insert_with_name_reference(
@@ -1571,7 +1636,8 @@ mod tests {
     #[test]
     fn safari_sends_a_tie_as_it_is() {
         // "?0" and "&&" code to 15 and 16 bits in Huffman: no shorter, so
-        // Safari sent them as they are (profiles/safari-27-macos.h3-qpack-ties).
+        // Safari sent them as they are
+        // (profiles/safari-27-macos.h3-qpack-ties).
         let mut enc = safari(100);
         let block = encode_on(&mut enc, 0, &[(b"&&", b"?0")]);
         assert_eq!(block, [0, 0, LITERAL | 2, b'&', b'&', 2, b'?', b'0']);
