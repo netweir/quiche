@@ -67,7 +67,9 @@ these follow the recording rather than the code:
   after them; and the encoder fills a server's table as Safari was
   recorded filling one (`qpack::Mode::Safari`): a field the second time
   it's sent, Huffman only where that's shorter, and nothing before the
-  server's SETTINGS come, even on a resumed connection.
+  server's SETTINGS come, even on a resumed connection. In a small table
+  it fills and copies as recorded against tables of 128 to 2048 bytes,
+  as closely as one rule could fit them.
 
 None of it changes quiche unless it's turned on, except the QPACK decoder,
 plain AES-GCM, the resend of early data turned down, and the pruned
