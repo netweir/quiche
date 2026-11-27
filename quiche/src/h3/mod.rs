@@ -1153,7 +1153,13 @@ impl Connection {
             // netweir: Chromium's encoder lets a server's table grow to its
             // own SETTINGS_QPACK_MAX_TABLE_CAPACITY (quic_spdy_session.cc,
             // OnSetting).
-            qpack_encoder: if config.chromium && !is_server {
+            // Safari's caps it at what Safari 27.2 was seen to allow.
+            qpack_encoder: if config.safari && !is_server {
+                qpack::Encoder::with_mode(
+                    qpack::Mode::Safari,
+                    qpack::SAFARI_MAX_TABLE_CAPACITY,
+                )
+            } else if config.chromium && !is_server {
                 qpack::Encoder::with_mode(
                     qpack::Mode::Chromium,
                     config.qpack_max_table_capacity.unwrap_or(0),

@@ -29,6 +29,7 @@
 pub use encoder::encode_int;
 pub use encoder::encode_str;
 pub use encoder::Mode;
+pub use encoder::SAFARI_MAX_TABLE_CAPACITY;
 
 pub const INDEXED: u8 = 0b1000_0000;
 pub const INDEXED_WITH_POST_BASE: u8 = 0b0001_0000;

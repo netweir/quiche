@@ -26,6 +26,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 
 use super::Error;
@@ -50,7 +51,23 @@ pub enum Mode {
     /// `SecondPassEncode`), Huffman only where it's shorter
     /// (qpack_instruction_encoder.cc).
     Chromium,
+
+    /// As Safari 27.2 was recorded encoding against a server that offered
+    /// a table (profiles/safari-27-macos.h3-qpack.capture.json): a field
+    /// goes in the table the second time it's sent once the table can be
+    /// used, under its name in the static table, else in the dynamic one,
+    /// else a literal name; the section that inserts refers to the new
+    /// entry past its Base, later ones from below it. With no stream
+    /// allowed to block, it still inserts but refers only to entries the
+    /// peer has acknowledged, and leaves out an insert that would name a
+    /// dynamic entry.
+    Safari,
 }
+
+/// netweir: how large Safari 27.2 let a server's table grow: 65536 bytes
+/// when the server offered 1 MiB, whatever its own
+/// SETTINGS_QPACK_MAX_TABLE_CAPACITY (16383).
+pub const SAFARI_MAX_TABLE_CAPACITY: u64 = 65536;
 
 /// A QPACK encoder.
 #[derive(Default)]
@@ -75,6 +92,9 @@ pub struct Encoder {
 
     /// The start of a decoder stream instruction not all here yet.
     decoder_in: Vec<u8>,
+
+    /// Safari: the fields sent once the table could be used.
+    sent: HashSet<(Vec<u8>, Vec<u8>)>,
 }
 
 impl Encoder {
@@ -236,9 +256,12 @@ impl Encoder {
     pub fn encode_for_stream<T: NameValue>(
         &mut self, stream_id: u64, headers: &[T], out: &mut [u8],
     ) -> Result<usize> {
+        let inserted_before = self.table.inserted();
+
         let representations = match self.mode {
             Mode::Static => return self.encode(headers, out),
             Mode::Chromium => self.first_pass_chromium(stream_id, headers),
+            Mode::Safari => self.first_pass_safari(stream_id, headers),
         };
 
         let referred: Vec<u64> = representations
@@ -258,8 +281,12 @@ impl Encoder {
         }
 
         // Chromium refers to entries from the Required Insert Count down,
-        // never past it (qpack_encoder.cc, SecondPassEncode).
-        let base = required_insert_count;
+        // never past it (qpack_encoder.cc, SecondPassEncode); Safari's Base
+        // is the insert count before the section's own inserts.
+        let base = match self.mode {
+            Mode::Safari => inserted_before,
+            _ => required_insert_count,
+        };
 
         let block =
             self.second_pass(&representations, required_insert_count, base);
@@ -466,6 +493,174 @@ impl Encoder {
                         value: value.to_vec(),
                     });
                 },
+            }
+        }
+
+        representations
+    }
+
+    /// Safari's first pass (see `Mode::Safari`). Dynamic indices are
+    /// absolute.
+    fn first_pass_safari<T: NameValue>(
+        &mut self, stream_id: u64, headers: &[T],
+    ) -> Vec<Representation> {
+        let mut representations = Vec::with_capacity(headers.len());
+
+        let usable = self.table.capacity > 0;
+        let known_received_count = self.blocking.known_received_count;
+        let blocking_allowed = self
+            .blocking
+            .blocking_allowed_on_stream(stream_id, self.max_blocked_streams);
+        let referable =
+            |index: u64| blocking_allowed || index < known_received_count;
+
+        // Entries an unacknowledged section needs, or the peer may not
+        // have yet, aren't evicted.
+        // shortcut: Safari's eviction wasn't recorded (no table filled);
+        // this is QUICHE's rule, until a recording fills one.
+        let mut smallest_non_evictable_index = self
+            .blocking
+            .smallest_blocking_index()
+            .min(known_received_count);
+
+        for (name, value) in split_values(headers) {
+            let found = self.table.find(&name, &value);
+
+            match found {
+                Match::NameAndValue {
+                    is_static: true,
+                    index,
+                } => {
+                    representations.push(Representation::Indexed {
+                        is_static: true,
+                        index,
+                    });
+                    continue;
+                },
+
+                Match::NameAndValue {
+                    is_static: false,
+                    index,
+                } if referable(index) => {
+                    representations.push(Representation::Indexed {
+                        is_static: false,
+                        index,
+                    });
+                    smallest_non_evictable_index =
+                        smallest_non_evictable_index.min(index);
+                    continue;
+                },
+
+                _ => (),
+            }
+
+            let in_table = matches!(found, Match::NameAndValue { .. });
+            let again =
+                usable && !self.sent.insert((name.clone(), value.clone()));
+            let by_name = self.table.find_name(&name);
+
+            if again && !in_table {
+                let size = entry_size(&name, &value);
+
+                let inserted = match by_name {
+                    Match::Name {
+                        is_static: true,
+                        index,
+                    } if size <=
+                        self.table.max_insert_size_without_evicting(
+                            smallest_non_evictable_index,
+                        ) =>
+                    {
+                        self.insert_with_name_reference(true, index, &value);
+                        true
+                    },
+
+                    Match::Name {
+                        is_static: false,
+                        index,
+                    } if blocking_allowed &&
+                        size <= self
+                            .table
+                            .max_insert_size_without_evicting(
+                                smallest_non_evictable_index.min(index),
+                            ) =>
+                    {
+                        let relative = self.table.inserted() - index - 1;
+                        self.insert_with_name_reference(false, relative, &value);
+                        true
+                    },
+
+                    Match::None
+                        if size <=
+                            self.table.max_insert_size_without_evicting(
+                                smallest_non_evictable_index,
+                            ) =>
+                    {
+                        // Insert With Literal Name.
+                        encode_string_vec(
+                            &name,
+                            0x40,
+                            5,
+                            true,
+                            self.huffman_strict(),
+                            &mut self.instructions,
+                        );
+                        encode_string_vec(
+                            &value,
+                            0x00,
+                            7,
+                            false,
+                            self.huffman_strict(),
+                            &mut self.instructions,
+                        );
+                        true
+                    },
+
+                    _ => false,
+                };
+
+                if inserted {
+                    let new_index = self.table.insert(&name, &value);
+
+                    if blocking_allowed {
+                        representations.push(Representation::Indexed {
+                            is_static: false,
+                            index: new_index,
+                        });
+                        smallest_non_evictable_index =
+                            smallest_non_evictable_index.min(new_index);
+                        continue;
+                    }
+                }
+            }
+
+            // As the field is sent the first time: its name from a table,
+            // else literals.
+            match self.table.find_name(&name) {
+                Match::Name {
+                    is_static: true,
+                    index,
+                } => representations.push(Representation::NameReference {
+                    is_static: true,
+                    index,
+                    value,
+                }),
+
+                Match::Name {
+                    is_static: false,
+                    index,
+                } if referable(index) => {
+                    representations.push(Representation::NameReference {
+                        is_static: false,
+                        index,
+                        value,
+                    });
+                    smallest_non_evictable_index =
+                        smallest_non_evictable_index.min(index);
+                },
+
+                _ =>
+                    representations.push(Representation::Literal { name, value }),
             }
         }
 
@@ -1257,6 +1452,113 @@ mod tests {
         let mut enc = chromium();
         assert_eq!(enc.on_decoder_stream(&[0x00]), Err(Error::DecoderStream));
         assert_eq!(enc.on_decoder_stream(&[0x01]), Err(Error::DecoderStream));
+    }
+
+    // netweir: Safari's encoder, as profiles/safari-27-macos.h3-qpack
+    // recorded it.
+
+    fn safari(blocked_streams: u64) -> Encoder {
+        let mut enc = Encoder::with_mode(Mode::Safari, SAFARI_MAX_TABLE_CAPACITY);
+        enc.on_peer_settings(Some(1 << 20), Some(blocked_streams));
+        enc
+    }
+
+    const FETCH: &[(&[u8], &[u8])] = &[
+        (b":method", b"GET"),
+        (b":authority", b"localhost"),
+        (b"sec-fetch-mode", b"cors"),
+        (b"accept", b"*/*"),
+    ];
+
+    #[test]
+    fn safari_inserts_a_field_the_second_time_it_is_sent() {
+        let mut enc = safari(100);
+
+        // The first time: names from the static table, else literals.
+        let first = encode_on(&mut enc, 0, FETCH);
+        let mut capacity = Vec::new();
+        encode_int_vec(SAFARI_MAX_TABLE_CAPACITY, 0x20, 5, &mut capacity);
+        assert_eq!(enc.take_instructions(), capacity, "65536, not 1 MiB");
+        let mut expected = vec![0, 0, 0xd1];
+        encode_int_vec(0, LITERAL_WITH_NAME_REF | 0x10, 4, &mut expected);
+        encode_string_vec(b"localhost", 0, 7, false, false, &mut expected);
+        encode_string_vec(
+            b"sec-fetch-mode",
+            LITERAL,
+            3,
+            true,
+            false,
+            &mut expected,
+        );
+        encode_string_vec(b"cors", 0, 7, false, false, &mut expected);
+        expected.push(0xc0 | 29);
+        assert_eq!(first, expected);
+
+        // The second time: inserted, under the static name and a literal
+        // one, and referred to past Base 0 (Required Insert Count 2,
+        // encoded 3; sign 1, delta 1).
+        let second = encode_on(&mut enc, 4, FETCH);
+        let mut inserts = vec![0xc0];
+        encode_string_vec(b"localhost", 0, 7, false, false, &mut inserts);
+        encode_string_vec(b"sec-fetch-mode", 0x40, 5, true, false, &mut inserts);
+        encode_string_vec(b"cors", 0, 7, false, false, &mut inserts);
+        assert_eq!(enc.take_instructions(), inserts);
+        assert_eq!(second, [0x03, 0x81, 0xd1, 0x10, 0x11, 0xc0 | 29]);
+
+        // Then from below Base 2.
+        let third = encode_on(&mut enc, 8, FETCH);
+        assert!(enc.take_instructions().is_empty());
+        assert_eq!(third, [0x03, 0x00, 0xd1, 0x81, 0x80, 0xc0 | 29]);
+    }
+
+    #[test]
+    fn safari_puts_a_new_value_under_a_dynamic_name() {
+        let mut enc = safari(100);
+        for stream in [0, 4] {
+            encode_on(&mut enc, stream, &[(b"sec-fetch-mode", b"cors")]);
+        }
+        enc.take_instructions();
+        // First time for "no-cors": the dynamic entry's name.
+        let first = encode_on(&mut enc, 8, &[(b"sec-fetch-mode", b"no-cors")]);
+        let mut expected = vec![0x02, 0x00, LITERAL_WITH_NAME_REF];
+        encode_string_vec(b"no-cors", 0, 7, false, false, &mut expected);
+        assert_eq!(first, expected);
+        // Second: inserted with that name, relative 0.
+        encode_on(&mut enc, 12, &[(b"sec-fetch-mode", b"no-cors")]);
+        let mut inserts = vec![0x80];
+        encode_string_vec(b"no-cors", 0, 7, false, false, &mut inserts);
+        assert_eq!(enc.take_instructions(), inserts);
+    }
+
+    #[test]
+    fn safari_without_blocked_streams_inserts_but_waits_to_refer() {
+        let mut enc = safari(0);
+        encode_on(&mut enc, 0, FETCH);
+        enc.take_instructions();
+        let second = encode_on(&mut enc, 4, FETCH);
+        assert_eq!(&second[..2], [0, 0], "nothing referred to yet");
+        assert!(!enc.take_instructions().is_empty(), "but inserted");
+        // Acknowledged by an Insert Count Increment of 2.
+        enc.on_decoder_stream(&[0x02]).unwrap();
+        let third = encode_on(&mut enc, 8, FETCH);
+        assert_eq!(third, [0x03, 0x00, 0xd1, 0x81, 0x80, 0xc0 | 29]);
+
+        // An insert that would name a dynamic entry is left out.
+        encode_on(&mut enc, 12, &[(b"sec-fetch-mode", b"no-cors")]);
+        encode_on(&mut enc, 16, &[(b"sec-fetch-mode", b"no-cors")]);
+        assert!(enc.take_instructions().is_empty());
+    }
+
+    #[test]
+    fn safari_uses_no_table_before_the_servers_settings() {
+        let mut enc = Encoder::with_mode(Mode::Safari, SAFARI_MAX_TABLE_CAPACITY);
+        encode_on(&mut enc, 0, FETCH);
+        enc.on_peer_settings(Some(65536), Some(100));
+        enc.take_instructions();
+        // What was sent before doesn't count: this is the first time.
+        let block = encode_on(&mut enc, 4, FETCH);
+        assert!(enc.take_instructions().is_empty());
+        assert_eq!(&block[..2], [0, 0]);
     }
 
     #[test]
