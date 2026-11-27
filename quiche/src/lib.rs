@@ -1652,6 +1652,10 @@ where
     /// Whether the connection handshake has been confirmed.
     handshake_confirmed: bool,
 
+    /// netweir: whether the server turned this connection's early data
+    /// down.
+    zero_rtt_rejected: bool,
+
     /// Key phase bit used for outgoing protected packets.
     key_phase: bool,
 
@@ -2321,6 +2325,8 @@ impl<F: BufFactory> Connection<F> {
             handshake_done_acked: false,
 
             handshake_confirmed: false,
+
+            zero_rtt_rejected: false,
 
             key_phase: false,
 
@@ -8105,6 +8111,13 @@ impl<F: BufFactory> Connection<F> {
         self.handshake.is_in_early_data()
     }
 
+    /// netweir: returns true if the server turned the connection's early
+    /// data down.
+    #[inline]
+    pub fn is_zero_rtt_rejected(&self) -> bool {
+        self.zero_rtt_rejected
+    }
+
     /// Returns the early data reason for the connection.
     ///
     /// This status can be useful for logging and debugging. See [BoringSSL]
@@ -8497,6 +8510,8 @@ impl<F: BufFactory> Connection<F> {
         // again at once, once the 1-RTT keys are in, rather than after loss
         // detection calls it lost (QuicSession::OnZeroRttRejected).
         if early_data_rejected {
+            self.zero_rtt_rejected = true;
+
             let handshake_status = self.handshake_status();
 
             for (_, p) in self.paths.iter_mut() {
