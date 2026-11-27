@@ -62,7 +62,9 @@ these follow the recording rather than the code:
   the 1200-byte datagram; packet numbers from 0.
 - `h3::Config::enable_safari`: SETTINGS as `enable_chromium` sends them,
   without SETTINGS_MAX_FIELD_SECTION_SIZE and without the GREASE frame
-  after them.
+  after them; and the encoder fills a server's table as Safari was
+  recorded filling one (`qpack::Mode::Safari`): a field the second time
+  it's sent.
 
 None of it changes quiche unless it's turned on, except the QPACK decoder,
 plain AES-GCM, the resend of early data turned down, and the pruned
