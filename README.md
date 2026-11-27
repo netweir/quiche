@@ -66,7 +66,8 @@ these follow the recording rather than the code:
   without SETTINGS_MAX_FIELD_SECTION_SIZE and without the GREASE frame
   after them; and the encoder fills a server's table as Safari was
   recorded filling one (`qpack::Mode::Safari`): a field the second time
-  it's sent.
+  it's sent, Huffman only where that's shorter, and nothing before the
+  server's SETTINGS come, even on a resumed connection.
 
 None of it changes quiche unless it's turned on, except the QPACK decoder,
 plain AES-GCM, the resend of early data turned down, and the pruned
