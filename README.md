@@ -43,7 +43,9 @@ behaviour comes from:
 - QPACK: the decoder fills and uses the dynamic table, and acknowledges it.
   With `h3::Config::enable_chromium`, the encoder fills a server's table
   as QUICHE's `QpackEncoder` does (`qpack::Mode::Chromium`), and codes a
-  string in Huffman only where that's shorter.
+  string in Huffman only where that's shorter. `Connection::resume_settings`
+  gives a resumed connection the server's last SETTINGS, so requests in
+  0-RTT fill its table, as Chrome's `ResumeApplicationState` does.
 - No libc cap, which clashed with Netweir's lockfile.
 - Early data a server turns down goes again as soon as the handshake is
   done, as QUICHE's `QuicSession::OnZeroRttRejected` has it, rather than
