@@ -41,6 +41,9 @@ behaviour comes from:
 - `h3::Config::enable_chromium`: SETTINGS order and GREASE, no streams
   opened before they're needed, Chrome's PRIORITY_UPDATE values.
 - QPACK: the decoder fills and uses the dynamic table, and acknowledges it.
+  With `h3::Config::enable_chromium`, the encoder fills a server's table
+  as QUICHE's `QpackEncoder` does (`qpack::Mode::Chromium`), and codes a
+  string in Huffman only where that's shorter.
 - No libc cap, which clashed with Netweir's lockfile.
 - Early data a server turns down goes again as soon as the handshake is
   done, as QUICHE's `QuicSession::OnZeroRttRejected` has it, rather than
