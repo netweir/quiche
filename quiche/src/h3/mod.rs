@@ -1091,6 +1091,10 @@ pub struct Connection {
 
     /// netweir: encoder instructions the encoder stream couldn't take yet.
     encoder_out: Vec<u8>,
+
+    /// netweir: the QPACK settings a resumed connection took from the
+    /// server's last SETTINGS, which the next ones must keep.
+    resumed_qpack: Option<(Option<u64>, Option<u64>)>,
 }
 
 impl Connection {
@@ -1170,6 +1174,8 @@ impl Connection {
             decoder_out: Vec::new(),
 
             encoder_out: Vec::new(),
+
+            resumed_qpack: None,
         })
     }
 
@@ -2796,6 +2802,70 @@ impl Connection {
         }
     }
 
+    /// netweir: on a resumed connection, before the server's SETTINGS
+    /// come, takes the QPACK settings from those it sent last time,
+    /// `settings` as `peer_settings_raw` returned them, so requests in
+    /// 0-RTT can fill its table, as Chromium does
+    /// (quic_spdy_client_session_base.cc, OnSettingsFrame keeps the
+    /// SETTINGS with the session; quic_spdy_session.cc,
+    /// ResumeApplicationState applies each). The SETTINGS that come then
+    /// must keep them (RFC 9114, Section 7.2.4.2). Only Chromium's
+    /// encoder does this.
+    pub fn resume_settings(&mut self, settings: &[(u64, u64)]) {
+        if self.qpack_encoder.mode() != qpack::Mode::Chromium {
+            return;
+        }
+
+        let find = |id| settings.iter().find(|(k, _)| *k == id).map(|(_, v)| *v);
+        let capacity = find(frame::SETTINGS_QPACK_MAX_TABLE_CAPACITY);
+        let blocked = find(frame::SETTINGS_QPACK_BLOCKED_STREAMS);
+
+        self.qpack_encoder.on_peer_settings(capacity, blocked);
+        self.resumed_qpack = Some((capacity, blocked));
+    }
+
+    /// netweir: whether the server's SETTINGS keep what a resumed
+    /// connection took from its last ones: Chromium closes the connection
+    /// when they omit a QPACK setting that wasn't 0 while early data was
+    /// taken, change the table's maximum capacity, or lower the blocked
+    /// streams (quic_spdy_client_session_base.cc, OnSettingsFrame;
+    /// quic_spdy_session.cc, OnSetting), with H3_SETTINGS_ERROR, or
+    /// INTERNAL_ERROR if the early data was turned down
+    /// (quic_error_codes.cc, QuicErrorCodeToTransportErrorCode).
+    fn resumed_settings_kept<F: BufFactory>(
+        &self, conn: &mut super::Connection<F>, capacity: Option<u64>,
+        blocked: Option<u64>,
+    ) -> Result<()> {
+        let Some((was_capacity, was_blocked)) = self.resumed_qpack else {
+            return Ok(());
+        };
+
+        let rejected = conn.is_zero_rtt_rejected();
+
+        let omitted = !rejected &&
+            ((was_blocked.unwrap_or(0) != 0 && blocked.is_none()) ||
+                (was_capacity.unwrap_or(0) != 0 && capacity.is_none()));
+
+        let changed = matches!((was_capacity, capacity), (Some(a), Some(b)) if a != b) ||
+            matches!((was_blocked, blocked), (Some(a), Some(b)) if b < a);
+
+        if !omitted && !changed {
+            return Ok(());
+        }
+
+        if rejected {
+            conn.close(false, 0x1, b"Server rejected 0-RTT, settings changed")?;
+        } else {
+            conn.close(
+                true,
+                Error::SettingsError.to_wire(),
+                b"Server accepted 0-RTT but changed its QPACK settings",
+            )?;
+        }
+
+        Err(Error::SettingsError)
+    }
+
     /// netweir: sends the QPACK encoder's instructions, opening the
     /// encoder stream first if it isn't open yet, as Chromium opens it only
     /// once it has something to send (qpack_send_stream.cc,
@@ -3490,7 +3560,13 @@ impl Connection {
                 raw,
                 ..
             } => {
-                // netweir: the encoder learns the table it may fill.
+                // netweir: the encoder learns the table it may fill, again
+                // on a resumed connection, as Chromium's OnSetting runs again.
+                self.resumed_settings_kept(
+                    conn,
+                    qpack_max_table_capacity,
+                    qpack_blocked_streams,
+                )?;
                 self.qpack_encoder
                     .on_peer_settings(qpack_max_table_capacity, qpack_blocked_streams);
 
@@ -4690,6 +4766,50 @@ mod tests {
         assert_eq!(s.poll_client(), Ok((stream, ev_headers)));
         assert_eq!(s.poll_client(), Ok((stream, Event::Finished)));
         assert_eq!(s.poll_client(), Err(Error::Done));
+    }
+
+    #[test]
+    /// netweir: a resumed Chromium client takes the server's last QPACK
+    /// SETTINGS before its new ones come, fills the table with the first
+    /// request, and the server reads it back.
+    fn chromium_resumed_settings_fill_the_table_at_once() {
+        let (mut config, mut h3_config) = Session::default_configs().unwrap();
+        h3_config.set_qpack_max_table_capacity(4096);
+        h3_config.set_qpack_blocked_streams(16);
+        h3_config.enable_chromium(true);
+        let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
+        s.client.resume_settings(&[(0x01, 4096), (0x07, 16)]);
+        s.handshake().unwrap();
+
+        let (stream, req) = s.send_request(true).unwrap();
+        let ev_headers = Event::Headers {
+            list: req,
+            more_frames: false,
+        };
+        assert_eq!(s.poll_server(), Ok((stream, ev_headers)));
+        assert!(s.server.peer_qpack_streams.encoder_stream_bytes > 0);
+        assert_eq!(s.poll_client(), Err(Error::Done), "SETTINGS kept");
+    }
+
+    #[test]
+    /// netweir: SETTINGS that change the table a resumed connection took
+    /// close it with H3_SETTINGS_ERROR, as Chromium's OnSetting does.
+    fn chromium_resumed_settings_must_be_kept() {
+        let (mut config, mut h3_config) = Session::default_configs().unwrap();
+        h3_config.set_qpack_max_table_capacity(4096);
+        h3_config.set_qpack_blocked_streams(16);
+        h3_config.enable_chromium(true);
+        let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
+        s.client.resume_settings(&[(0x01, 8192), (0x07, 16)]);
+        // The client reads the server's SETTINGS as the handshake ends.
+        s.handshake().ok();
+        s.advance().ok();
+        s.poll_client().ok();
+
+        assert_eq!(
+            s.pipe.client.local_error().map(|e| (e.is_app, e.error_code)),
+            Some((true, Error::SettingsError.to_wire()))
+        );
     }
 
     #[test]

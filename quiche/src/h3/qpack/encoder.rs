@@ -118,6 +118,11 @@ impl Encoder {
         }
     }
 
+    /// netweir: the way this encoder uses the peer's table.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
     /// netweir: takes the encoder stream instructions to send.
     pub fn take_instructions(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.instructions)
